@@ -137,6 +137,17 @@ def cmd_run(args: argparse.Namespace) -> None:
     )
     cmd_process(process_args)
 
+    # ns-process-data sometimes exits 0 despite a worker-process crash
+    # in feature extraction or matching, leaving transforms.json missing.
+    # Bail explicitly rather than letting ns-train report a confusing
+    # FileNotFoundError downstream.
+    transforms_path = processed_dir / "transforms.json"
+    if not transforms_path.is_file():
+        raise SystemExit(
+            f"SfM did not produce {transforms_path}. "
+            f"Inspect ns-process-data output above for the actual failure."
+        )
+
     train_args = argparse.Namespace(
         data=str(processed_dir),
         output=str(train_dir),

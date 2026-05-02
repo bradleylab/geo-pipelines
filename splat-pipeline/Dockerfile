@@ -9,7 +9,12 @@ FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 ENV TZ=UTC \
     DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    # Suppress user-site (~/.local/...) lookups. enroot bind-mounts $HOME
+    # by default; without this, the user's pip-installed packages override
+    # the container's pinned versions (classic numpy 2.x leak that breaks
+    # torch+nerfstudio extensions compiled against numpy 1.x).
+    PYTHONNOUSERSITE=1
 
 # H100 only by default. Override with --build-arg CUDA_ARCHITECTURES="86;89;90"
 # for multi-arch builds.
