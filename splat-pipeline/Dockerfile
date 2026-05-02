@@ -123,9 +123,16 @@ RUN GSPLAT_VERSION=$(pip show gsplat | awk '/^Version:/ {print $2}') \
 # ----------------------------------------------------------------------
 # hloc for SuperPoint+LightGlue front-end (forest scenes need this; SIFT
 # fails on bark/leaf repetition).
+#
+# hloc uses git submodules for SuperGluePretrainedNetwork (provides the
+# pretrained SuperPoint and SuperGlue weights). `pip install git+...`
+# does NOT init submodules, which makes hloc.extractors.superpoint fail
+# at import time with ModuleNotFoundError. Clone --recursive then install
+# from the local path so submodules are present.
 # ----------------------------------------------------------------------
-RUN pip install \
-        git+https://github.com/cvg/Hierarchical-Localization.git@master
+RUN git clone --recursive --depth 1 \
+        https://github.com/cvg/Hierarchical-Localization.git /opt/hloc \
+    && pip install --no-build-isolation /opt/hloc
 
 # ----------------------------------------------------------------------
 # CLI wrapper
