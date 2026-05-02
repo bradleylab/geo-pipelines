@@ -51,6 +51,12 @@ RUN git clone https://github.com/colmap/colmap.git \
 # Python: pip + PyTorch matching CUDA 11.8
 # ----------------------------------------------------------------------
 RUN python -m pip install --upgrade pip setuptools wheel
+
+# Pin numpy<2: torch 2.1.2 + nerfstudio 1.1.x stack predates numpy 2.x ABI.
+# Without this, the torch wheel pulls numpy 2.2 transitively and downstream
+# extensions (nerfstudio, hloc) compile against the old API. Lock to 1.x.
+RUN pip install "numpy<2"
+
 RUN pip install \
         torch==2.1.2 \
         torchvision==0.16.2 \
@@ -59,9 +65,14 @@ RUN pip install \
 # ----------------------------------------------------------------------
 # tinycudann (needed by some nerfstudio methods, e.g. nerfacto)
 # Compile-from-source against our CUDA + arch.
+#
+# --no-build-isolation: tcnn's setup.py imports pkg_resources but doesn't
+# declare setuptools as a PEP 517 build-dep, so pip's isolated build env
+# omits it and the install errors with "No module named 'pkg_resources'".
+# Using the host env (which has setuptools) avoids this.
 # ----------------------------------------------------------------------
 RUN pip install ninja
-RUN pip install \
+RUN pip install --no-build-isolation \
         git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 
 # ----------------------------------------------------------------------
@@ -70,12 +81,19 @@ RUN pip install \
 ARG NERFSTUDIO_VERSION=1.1.5
 RUN pip install nerfstudio==${NERFSTUDIO_VERSION}
 
+# Re-pin numpy<2 in case nerfstudio's deps bumped it.
+RUN pip install "numpy<2"
+
 # ----------------------------------------------------------------------
 # gsplat: force-rebuild from source so wheel matches our CUDA arch.
 # nerfstudio installs a compatible pinned version; we recompile in place.
+# --no-deps: don't touch its dependencies (we already have the right torch).
+# --no-binary gsplat: only force source build for gsplat itself.
 # ----------------------------------------------------------------------
-RUN pip install --force-reinstall --no-binary=:all: \
-        $(pip show gsplat | awk '/Name|Version/ {print $2}' | paste -sd '==' -)
+RUN GSPLAT_VERSION=$(pip show gsplat | awk '/^Version:/ {print $2}') \
+    && echo "rebuilding gsplat ${GSPLAT_VERSION} for sm_90" \
+    && pip install --no-deps --force-reinstall --no-binary=gsplat \
+        "gsplat==${GSPLAT_VERSION}"
 
 # ----------------------------------------------------------------------
 # hloc for SuperPoint+LightGlue front-end (forest scenes need this; SIFT
