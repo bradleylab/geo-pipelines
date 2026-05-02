@@ -13,8 +13,17 @@ ENV TZ=UTC \
 
 # H100 only by default. Override with --build-arg CUDA_ARCHITECTURES="86;89;90"
 # for multi-arch builds.
+#
+# Three different env vars feed into the build because each subsystem reads
+# its own:
+#   - CMAKE_CUDA_ARCHITECTURES (cmake/COLMAP) — semicolon-separated SM nums (90)
+#   - TORCH_CUDA_ARCH_LIST (PyTorch + gsplat) — semicolon-separated SM versions (9.0)
+#   - TCNN_CUDA_ARCHITECTURES (tinycudann) — semicolon-separated SM nums (90)
+# tcnn falls back to runtime CUDA introspection if unset, which fails on
+# GHA runners with no GPU. Explicit setting is mandatory here.
 ARG CUDA_ARCHITECTURES=90
 ENV TORCH_CUDA_ARCH_LIST=9.0
+ENV TCNN_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
 # ----------------------------------------------------------------------
 # System dependencies: COLMAP build deps, Python, ffmpeg
