@@ -124,15 +124,28 @@ RUN GSPLAT_VERSION=$(pip show gsplat | awk '/^Version:/ {print $2}') \
 # hloc for SuperPoint+LightGlue front-end (forest scenes need this; SIFT
 # fails on bark/leaf repetition).
 #
-# hloc uses git submodules for SuperGluePretrainedNetwork (provides the
-# pretrained SuperPoint and SuperGlue weights). `pip install git+...`
-# does NOT init submodules, which makes hloc.extractors.superpoint fail
-# at import time with ModuleNotFoundError. Clone --recursive then install
-# from the local path so submodules are present.
+# hloc uses git submodules under third_party/, notably
+# SuperGluePretrainedNetwork (the upstream SuperPoint reference impl).
+# Two non-obvious wiring steps required:
+#
+# 1. `pip install git+...` does NOT init submodules. Clone --recursive
+#    so third_party/SuperGluePretrainedNetwork is on disk.
+# 2. hloc's __init__.py adds `<hloc-parent>/third_party` to sys.path so
+#    SuperGluePretrainedNetwork is importable at the top level. This
+#    only works for editable installs (`pip install -e`) where hloc
+#    stays at its source path. A non-editable install copies hloc/ into
+#    site-packages but leaves third_party/ behind, making
+#    `from SuperGluePretrainedNetwork.models import ...` fail.
+#
+# Solution: editable install AND add /opt/hloc/third_party to PYTHONPATH
+# explicitly. Belt and braces — either alone is enough but combined
+# survives changes to hloc's __init__.
 # ----------------------------------------------------------------------
 RUN git clone --recursive --depth 1 \
         https://github.com/cvg/Hierarchical-Localization.git /opt/hloc \
-    && pip install --no-build-isolation /opt/hloc
+    && pip install --no-build-isolation -e /opt/hloc
+
+ENV PYTHONPATH=/opt/hloc/third_party:${PYTHONPATH}
 
 # ----------------------------------------------------------------------
 # CLI wrapper
