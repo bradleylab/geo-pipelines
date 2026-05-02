@@ -98,10 +98,14 @@ RUN pip install "numpy<2"
 # nerfstudio installs a compatible pinned version; we recompile in place.
 # --no-deps: don't touch its dependencies (we already have the right torch).
 # --no-binary gsplat: only force source build for gsplat itself.
+# --no-build-isolation: same reason as tcnn — gsplat's setup.py imports
+# torch, which isn't in the build-isolation env. Use the host env where
+# torch is actually installed.
 # ----------------------------------------------------------------------
 RUN GSPLAT_VERSION=$(pip show gsplat | awk '/^Version:/ {print $2}') \
     && echo "rebuilding gsplat ${GSPLAT_VERSION} for sm_90" \
     && pip install --no-deps --force-reinstall --no-binary=gsplat \
+        --no-build-isolation \
         "gsplat==${GSPLAT_VERSION}"
 
 # ----------------------------------------------------------------------
