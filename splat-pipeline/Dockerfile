@@ -9,12 +9,7 @@ FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 ENV TZ=UTC \
     DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    # Suppress user-site (~/.local/...) lookups. enroot bind-mounts $HOME
-    # by default; without this, the user's pip-installed packages override
-    # the container's pinned versions (classic numpy 2.x leak that breaks
-    # torch+nerfstudio extensions compiled against numpy 1.x).
-    PYTHONNOUSERSITE=1
+    PIP_NO_CACHE_DIR=1
 
 # H100 only by default. Override with --build-arg CUDA_ARCHITECTURES="86;89;90"
 # for multi-arch builds.
@@ -151,6 +146,16 @@ RUN git clone --recursive --depth 1 \
     && pip install --no-build-isolation -e /opt/hloc
 
 ENV PYTHONPATH=/opt/hloc/third_party:${PYTHONPATH}
+
+# ----------------------------------------------------------------------
+# Suppress user-site (~/.local/...) lookups at runtime. enroot bind-mounts
+# $HOME by default; without this, the user's pip-installed packages
+# override the container's pinned versions (classic numpy 2.x leak that
+# breaks torch+nerfstudio extensions compiled against numpy 1.x).
+# Placed late in the Dockerfile so it doesn't invalidate the COLMAP +
+# tcnn + nerfstudio + gsplat compile cache when only this changes.
+# ----------------------------------------------------------------------
+ENV PYTHONNOUSERSITE=1
 
 # ----------------------------------------------------------------------
 # CLI wrapper
