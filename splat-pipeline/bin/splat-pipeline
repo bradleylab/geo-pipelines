@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""splat-pipeline: video/photos -> 3D Gaussian Splat (.ply).
+
+Subcommands:
+    process   Run SfM on a video or image directory, produce nerfstudio
+              dataset (transforms.json + COLMAP sparse cloud).
+    train     Train splatfacto-big on a processed dataset.
+    export    Export a trained splat to .ply.
+    run       process + train + export, in sequence.
+
+The wrapper bakes in forest-scene defaults: SuperPoint+LightGlue front-end,
+300 frames target, 30k iterations, splatfacto-big. Override via flags.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VIDEO_SUFFIXES = {".mov", ".mp4", ".m4v", ".avi", ".mkv"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+
+
+def detect_input_type(path: Path) -> str:
+    """Return 'video' or 'images' based on input path."""
+    if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
+        return "video"
+    if path.is_dir():
+        has_images = any(
+            p.suffix.lower() in IMAGE_SUFFIXES for p in path.iterdir()
+        )
+        if has_images:
+            return "images"
+        raise SystemExit(f"error: {path} is a directory but contains no images")
+    raise SystemExit(
+        f"error: {path} must be a video file ({sorted(VIDEO_SUFFIXES)}) "
+        f"or a directory of images ({sorted(IMAGE_SUFFIXES)})"
+    )
+
+
+def run(cmd: list[str]) -> None:
+    """Run a subprocess, echoing the command and aborting on failure."""
+    print(f"$ {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise SystemExit(f"command failed with exit code {result.returncode}")
+
+
+def cmd_process(args: argparse.Namespace) -> None:
+    """Run ns-process-data on a video or image directory."""
+    input_path = Path(args.input).resolve()
+    output_dir = Path(args.output).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    mode = detect_input_type(input_path)
+    print(f"detected input type: {mode}", flush=True)
+
+    cmd = [
+        "ns-process-data",
+        mode,
+        "--data", str(input_path),
+        "--output-dir", str(output_dir),
+        "--feature-type", args.feature_type,
+        "--matcher-type", args.matcher_type,
+    ]
+    if mode == "video":
+        cmd += ["--num-frames-target", str(args.num_frames_target)]
+    if args.skip_colmap:
+        cmd += ["--skip-colmap"]
+
+    run(cmd)
+
+
+def cmd_train(args: argparse.Namespace) -> None:
+    """Train splatfacto-big on a processed dataset."""
+    data_dir = Path(args.data).resolve()
+    output_dir = Path(args.output).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "ns-train", args.method,
+        "--data", str(data_dir),
+        "--output-dir", str(output_dir),
+        "--max-num-iterations", str(args.max_num_iterations),
+        "--viewer.quit-on-train-completion", "True",
+    ]
+    if args.experiment_name:
+        cmd += ["--experiment-name", args.experiment_name]
+
+    run(cmd)
+
+
+def find_latest_config(output_dir: Path) -> Path:
+    """Find the most recent config.yml under a nerfstudio output directory."""
+    configs = sorted(output_dir.rglob("config.yml"), key=lambda p: p.stat().st_mtime)
+    if not configs:
+        raise SystemExit(
+            f"no config.yml found under {output_dir} — did training complete?"
+        )
+    return configs[-1]
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    """Export a trained splat to .ply via ns-export gaussian-splat."""
+    if args.config:
+        config_path = Path(args.config).resolve()
+    else:
+        config_path = find_latest_config(Path(args.output_dir).resolve())
+
+    export_dir = Path(args.export_dir).resolve()
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    run([
+        "ns-export", "gaussian-splat",
+        "--load-config", str(config_path),
+        "--output-dir", str(export_dir),
+    ])
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Full pipeline: process + train + export."""
+    output_root = Path(args.output).resolve()
+    processed_dir = output_root / "processed"
+    train_dir = output_root / "training"
+    export_dir = output_root / "exports"
+
+    process_args = argparse.Namespace(
+        input=args.input,
+        output=str(processed_dir),
+        feature_type=args.feature_type,
+        matcher_type=args.matcher_type,
+        num_frames_target=args.num_frames_target,
+        skip_colmap=False,
+    )
+    cmd_process(process_args)
+
+    train_args = argparse.Namespace(
+        data=str(processed_dir),
+        output=str(train_dir),
+        method=args.method,
+        max_num_iterations=args.max_num_iterations,
+        experiment_name=args.experiment_name,
+    )
+    cmd_train(train_args)
+
+    export_args = argparse.Namespace(
+        config=None,
+        output_dir=str(train_dir),
+        export_dir=str(export_dir),
+    )
+    cmd_export(export_args)
+
+    print(f"\nsplat-pipeline complete. Products at: {output_root}", flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="splat-pipeline",
+        description="video/photos -> 3D Gaussian Splat (.ply)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # process
+    pp = sub.add_parser("process", help="run SfM on input video or image dir")
+    pp.add_argument("--input", required=True,
+                    help="video file or directory of images")
+    pp.add_argument("--output", required=True,
+                    help="output directory for processed dataset")
+    pp.add_argument("--feature-type", default="superpoint",
+                    help="default: superpoint (SIFT fails on bark/leaf)")
+    pp.add_argument("--matcher-type", default="superpoint+lightglue",
+                    help="default: superpoint+lightglue")
+    pp.add_argument("--num-frames-target", type=int, default=300,
+                    help="frames extracted from video (300-500 sweet spot)")
+    pp.add_argument("--skip-colmap", action="store_true",
+                    help="reuse existing COLMAP sparse output")
+    pp.set_defaults(func=cmd_process)
+
+    # train
+    pt = sub.add_parser("train", help="train splatfacto-big on processed data")
+    pt.add_argument("--data", required=True, help="processed dataset dir")
+    pt.add_argument("--output", required=True, help="training output dir")
+    pt.add_argument("--method", default="splatfacto-big",
+                    help="default: splatfacto-big (~30 GB VRAM, H100)")
+    pt.add_argument("--max-num-iterations", type=int, default=30000)
+    pt.add_argument("--experiment-name", default=None)
+    pt.set_defaults(func=cmd_train)
+
+    # export
+    pe = sub.add_parser("export", help="export trained splat to .ply")
+    pe.add_argument("--config",
+                    help="path to config.yml (default: latest under --output-dir)")
+    pe.add_argument("--output-dir",
+                    help="training output dir (used to find latest config.yml)")
+    pe.add_argument("--export-dir", required=True,
+                    help="where to write splat.ply")
+    pe.set_defaults(func=cmd_export)
+
+    # run
+    pr = sub.add_parser("run", help="process + train + export end-to-end")
+    pr.add_argument("--input", required=True)
+    pr.add_argument("--output", required=True,
+                    help="root output dir; subdirs processed/, training/, exports/")
+    pr.add_argument("--feature-type", default="superpoint")
+    pr.add_argument("--matcher-type", default="superpoint+lightglue")
+    pr.add_argument("--num-frames-target", type=int, default=300)
+    pr.add_argument("--method", default="splatfacto-big")
+    pr.add_argument("--max-num-iterations", type=int, default=30000)
+    pr.add_argument("--experiment-name", default=None)
+    pr.set_defaults(func=cmd_run)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Sanity check: required tools available
+    for tool in ("ns-process-data", "ns-train", "ns-export", "colmap", "ffmpeg"):
+        if shutil.which(tool) is None:
+            raise SystemExit(
+                f"error: {tool} not on PATH — is the splat-pipeline container "
+                f"built correctly?"
+            )
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

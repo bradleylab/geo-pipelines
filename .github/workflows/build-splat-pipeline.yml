@@ -1,0 +1,93 @@
+name: build splat-pipeline
+
+# Builds and pushes ghcr.io/bradleylab/splat-pipeline.
+# Triggers:
+#   - push to main when splat-pipeline/** changes -> :latest
+#   - tag matching splat-pipeline-v* -> :vN and :latest
+#   - manual dispatch with a version_tag input
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'splat-pipeline/**'
+      - '.github/workflows/build-splat-pipeline.yml'
+    tags:
+      - 'splat-pipeline-v*'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Stable version tag (e.g. v1) — empty = latest only'
+        required: false
+        default: ''
+
+env:
+  IMAGE_NAME: bradleylab/splat-pipeline
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up runner disk
+        # Default GH runners ship full of preinstalled tooling that we don't
+        # need. CUDA + COLMAP + PyTorch builds need elbow room.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost
+          sudo apt-get clean
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          # Tag-driven release: refs/tags/splat-pipeline-vN
+          if [[ "${GITHUB_REF}" == refs/tags/splat-pipeline-v* ]]; then
+            VTAG="${GITHUB_REF#refs/tags/splat-pipeline-}"
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VTAG}"
+          fi
+          # Manual dispatch with version_tag
+          if [[ -n "${{ github.event.inputs.version_tag }}" ]]; then
+            VTAG="${{ github.event.inputs.version_tag }}"
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VTAG}"
+          fi
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
+          echo "computed tags: ${TAGS}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: splat-pipeline
+          file: splat-pipeline/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Cache via GHCR registry to speed up incremental builds
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Image summary
+        run: |
+          echo "## splat-pipeline image built" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Tags pushed:" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          for t in $(echo "${{ steps.tags.outputs.tags }}" | tr ',' ' '); do
+            echo "- \`${t}\`" >> "${GITHUB_STEP_SUMMARY}"
+          done
