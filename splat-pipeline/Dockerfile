@@ -38,6 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgflags-dev libglew-dev libgoogle-glog-dev libmetis-dev \
         libqt5opengl5-dev libsqlite3-dev libsuitesparse-dev qtbase5-dev \
         libceres-dev \
+        # gsplat CUDA extensions need GLM headers (glm/glm.hpp)
+        libglm-dev \
         # Python
         python3.10 python3.10-dev python3-pip python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
