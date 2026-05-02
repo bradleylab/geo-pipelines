@@ -25,6 +25,16 @@ ARG CUDA_ARCHITECTURES=90
 ENV TORCH_CUDA_ARCH_LIST=9.0
 ENV TCNN_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
+# Cap parallel compile jobs for tcnn + gsplat. PyTorch's cpp_extension
+# auto-detects nproc and runs MAX_JOBS nvcc instances in parallel; each
+# uses 2-4 GB peak. GitHub-hosted runners have 16 GB RAM, so MAX_JOBS=10
+# (the auto-detected default on a 4-vCPU runner) blows memory and causes
+# "runner lost communication" mid-build. MAX_JOBS=2 keeps memory in
+# budget at the cost of slower compile. Override with --build-arg
+# MAX_JOBS=8 on a larger machine.
+ARG MAX_JOBS=2
+ENV MAX_JOBS=${MAX_JOBS}
+
 # ----------------------------------------------------------------------
 # System dependencies: COLMAP build deps, Python, ffmpeg
 # ----------------------------------------------------------------------
