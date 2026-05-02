@@ -143,7 +143,11 @@ RUN GSPLAT_VERSION=$(pip show gsplat | awk '/^Version:/ {print $2}') \
 # ----------------------------------------------------------------------
 RUN git clone --recursive --depth 1 \
         https://github.com/cvg/Hierarchical-Localization.git /opt/hloc \
-    && pip install --no-build-isolation -e /opt/hloc
+    && pip install --no-build-isolation -e /opt/hloc \
+    # hloc's deps resolve numpy unconstrained, which lets pip pull
+    # numpy 2.x. Force back to 1.x last so torch + nerfstudio C-extensions
+    # (compiled against the 1.x ABI) work at runtime.
+    && pip install "numpy<2"
 
 ENV PYTHONPATH=/opt/hloc/third_party:${PYTHONPATH}
 
