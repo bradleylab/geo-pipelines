@@ -19,6 +19,7 @@ Recipes:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -30,6 +31,23 @@ from pathlib import Path
 CRS_RE = re.compile(r"^[A-Za-z]{3,10}:\d{2,7}$")
 COG_COMPRESSIONS = {"DEFLATE", "ZSTD", "LZW", "NONE"}
 RESAMPLINGS = {"nearest", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode"}
+
+
+def _ensure_toolchain_on_path() -> None:
+    """Put this interpreter's directory on PATH so gdal/pdal binaries resolve.
+
+    conda-forge installs gdal_translate/gdalwarp/gdaldem/pdal into the same
+    prefix bin as the Python that runs this CLI. On Compute2 the image runs via
+    ``srun ... bash -lc``, and that login shell can rewrite PATH from
+    ``/etc/profile`` and drop the conda prefix — which would make the recipes'
+    ``subprocess`` calls fail with FileNotFoundError even though the tools are
+    installed. Prepending ``sys.executable``'s directory makes the CLI
+    self-contained regardless of the launch shell.
+    """
+    bindir = str(Path(sys.executable).resolve().parent)
+    existing = os.environ.get("PATH", "")
+    if bindir not in existing.split(os.pathsep):
+        os.environ["PATH"] = bindir + os.pathsep + existing if existing else bindir
 
 
 def _fail(msg: str) -> None:
@@ -185,6 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _ensure_toolchain_on_path()
     args = build_parser().parse_args(argv)
     return args.func(args)
 
