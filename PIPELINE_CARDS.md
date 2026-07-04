@@ -69,3 +69,42 @@ TLS-anchored visualization figures.
 *Planned.* Drone imagery → orthophoto + DEM via OpenDroneMap.
 
 (Card to be filled in when the pipeline is built.)
+
+---
+
+## geo-tools
+
+**Purpose.** Bounded GDAL/PDAL geoprocessing recipes: turn one input into one
+geospatial artifact via a fixed, validated command. Kitchen-sink exception to
+the one-pipeline-per-container rule (documented in `geo-tools/README.md`): the
+recipes share the exact same GDAL+PDAL base, so bundling avoids N-fold build /
+storage / `.sqsh` cost.
+
+**Inputs.** A single raster (`.tif`) or point cloud (`.las`/`.laz`), plus
+per-recipe arguments — all validated (CRS as an authority code, compression /
+resampling enums, angle ranges).
+
+**Products.** One artifact per recipe:
+- `tiff-to-cog` → Cloud-Optimized GeoTIFF (DEFLATE default)
+- `reproject` → reprojected raster
+- `hillshade` → hillshade raster
+- `laz-to-copc` → Cloud-Optimized Point Cloud (`.copc.laz`)
+- `reproject-laz` → reprojected LAS/LAZ
+
+**Run.** `geo-tools <recipe> --input <in> --output <out> [recipe args]`. No
+recipe accepts a free-form gdal/pdal string; commands run as an argv list.
+
+**Stack.**
+- Base: `mambaorg/micromamba:1.5.10`
+- GDAL + PDAL from conda-forge (pinned minor series; COG driver, DEFLATE/ZSTD/LZW,
+  COPC reader/writer, reprojection filter)
+
+**Known boundaries.**
+- `laz-to-dem` (ground-classified DEM from a point cloud) is deliberately NOT
+  here — it involves a real ground-classification methods choice and is deferred
+  to a later phase.
+- Recipes are single-input, single-output. Batch / mosaic workflows belong in an
+  analysis repo.
+
+**Lab status.** Active. v1 target: natural-language geoprocessing via `@atlas`
+(the Slack agent) on Compute2.
