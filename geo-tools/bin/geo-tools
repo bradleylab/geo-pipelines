@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""geo-tools — bounded GDAL/PDAL geoprocessing recipes.
+
+Each recipe turns one input into one geospatial artifact via a fixed GDAL or
+PDAL command assembled from *validated* arguments. No recipe accepts a
+free-form gdal/pdal command string; unbounded or unexpected values are
+rejected before any tool runs. Commands are executed with an argv list (never
+a shell), so an argument can never inject a second command. This validation
+mirrors the server-side validation in the dispatching layer — defense in depth.
+
+Recipes:
+  tiff-to-cog     raster  -> Cloud-Optimized GeoTIFF
+  reproject       raster  -> reprojected raster
+  hillshade       DEM     -> hillshade raster
+  laz-to-copc     LAS/LAZ -> Cloud-Optimized Point Cloud (.copc.laz)
+  reproject-laz   LAS/LAZ -> reprojected LAS/LAZ
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# A CRS token flows onto a command line, so restrict it to an authority:code
+# form (e.g. EPSG:32615) with no shell-significant characters. Free proj4/WKT
+# strings are intentionally not accepted here.
+CRS_RE = re.compile(r"^[A-Za-z]{3,10}:\d{2,7}$")
+COG_COMPRESSIONS = {"DEFLATE", "ZSTD", "LZW", "NONE"}
+RESAMPLINGS = {"nearest", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode"}
+
+
+def _fail(msg: str) -> None:
+    print(f"geo-tools: error: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _crs(value: str) -> str:
+    if not CRS_RE.match(value):
+        _fail(f"invalid CRS {value!r}; expected an authority code like EPSG:32615")
+    return value
+
+
+def _existing_input(path: str) -> str:
+    if not Path(path).is_file():
+        _fail(f"input file not found: {path}")
+    return path
+
+
+def _bounded_float(value: str, name: str, lo: float, hi: float) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        _fail(f"{name} must be a number, got {value!r}")
+    if not (lo <= parsed <= hi):
+        _fail(f"{name} must be in [{lo}, {hi}], got {parsed}")
+    return parsed
+
+
+def _run(cmd: list[str]) -> int:
+    print("geo-tools: running:", " ".join(cmd), flush=True)
+    return subprocess.run(cmd, check=False).returncode
+
+
+def recipe_tiff_to_cog(a: argparse.Namespace) -> int:
+    if a.compression not in COG_COMPRESSIONS:
+        _fail(f"compression must be one of {sorted(COG_COMPRESSIONS)}")
+    return _run(
+        [
+            "gdal_translate",
+            "-of",
+            "COG",
+            "-co",
+            f"COMPRESS={a.compression}",
+            "-co",
+            "OVERVIEWS=AUTO",
+            "-co",
+            "NUM_THREADS=ALL_CPUS",
+            "-co",
+            "BIGTIFF=IF_SAFER",
+            _existing_input(a.input),
+            a.output,
+        ]
+    )
+
+
+def recipe_reproject(a: argparse.Namespace) -> int:
+    if a.resampling not in RESAMPLINGS:
+        _fail(f"resampling must be one of {sorted(RESAMPLINGS)}")
+    return _run(
+        [
+            "gdalwarp",
+            "-t_srs",
+            _crs(a.target_crs),
+            "-r",
+            a.resampling,
+            "-multi",
+            "-overwrite",
+            _existing_input(a.input),
+            a.output,
+        ]
+    )
+
+
+def recipe_hillshade(a: argparse.Namespace) -> int:
+    z = _bounded_float(a.z_factor, "z-factor", 0.0, 100.0)
+    az = _bounded_float(a.azimuth, "azimuth", 0.0, 360.0)
+    alt = _bounded_float(a.altitude, "altitude", 0.0, 90.0)
+    return _run(
+        [
+            "gdaldem",
+            "hillshade",
+            "-z",
+            str(z),
+            "-az",
+            str(az),
+            "-alt",
+            str(alt),
+            "-compute_edges",
+            _existing_input(a.input),
+            a.output,
+        ]
+    )
+
+
+def recipe_laz_to_copc(a: argparse.Namespace) -> int:
+    if not a.output.endswith(".copc.laz"):
+        _fail("laz-to-copc output must end in .copc.laz")
+    return _run(
+        ["pdal", "translate", _existing_input(a.input), a.output, "--writers.copc.forward=all"]
+    )
+
+
+def recipe_reproject_laz(a: argparse.Namespace) -> int:
+    return _run(
+        [
+            "pdal",
+            "translate",
+            _existing_input(a.input),
+            a.output,
+            "reprojection",
+            f"--filters.reprojection.out_srs={_crs(a.target_crs)}",
+        ]
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="geo-tools", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="recipe", required=True)
+
+    def _io(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--input", required=True, help="input file path")
+        p.add_argument("--output", required=True, help="output file path")
+
+    p = sub.add_parser("tiff-to-cog", help="raster -> Cloud-Optimized GeoTIFF")
+    _io(p)
+    p.add_argument("--compression", default="DEFLATE", help="COG compression (default DEFLATE)")
+    p.set_defaults(func=recipe_tiff_to_cog)
+
+    p = sub.add_parser("reproject", help="raster -> reprojected raster")
+    _io(p)
+    p.add_argument("--target-crs", required=True, help="target CRS, e.g. EPSG:32615")
+    p.add_argument("--resampling", default="bilinear", help="resampling method (default bilinear)")
+    p.set_defaults(func=recipe_reproject)
+
+    p = sub.add_parser("hillshade", help="DEM -> hillshade raster")
+    _io(p)
+    p.add_argument("--z-factor", default="1", help="vertical exaggeration (default 1)")
+    p.add_argument("--azimuth", default="315", help="light azimuth degrees (default 315)")
+    p.add_argument("--altitude", default="45", help="light altitude degrees (default 45)")
+    p.set_defaults(func=recipe_hillshade)
+
+    p = sub.add_parser("laz-to-copc", help="LAS/LAZ -> Cloud-Optimized Point Cloud")
+    _io(p)
+    p.set_defaults(func=recipe_laz_to_copc)
+
+    p = sub.add_parser("reproject-laz", help="LAS/LAZ -> reprojected LAS/LAZ")
+    _io(p)
+    p.add_argument("--target-crs", required=True, help="target CRS, e.g. EPSG:32615")
+    p.set_defaults(func=recipe_reproject_laz)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

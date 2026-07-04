@@ -1,0 +1,83 @@
+name: build geo-tools
+
+# Builds and pushes ghcr.io/bradleylab/geo-tools.
+# Triggers:
+#   - push to main when geo-tools/** changes -> :latest
+#   - tag matching geo-tools-v* -> :vN and :latest
+#   - manual dispatch with a version_tag input
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'geo-tools/**'
+      - '.github/workflows/build-geo-tools.yml'
+    tags:
+      - 'geo-tools-v*'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Stable version tag (e.g. v1) — empty = latest only'
+        required: false
+        default: ''
+
+env:
+  IMAGE_NAME: bradleylab/geo-tools
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          # Tag-driven release: refs/tags/geo-tools-vN
+          if [[ "${GITHUB_REF}" == refs/tags/geo-tools-v* ]]; then
+            VTAG="${GITHUB_REF#refs/tags/geo-tools-}"
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VTAG}"
+          fi
+          # Manual dispatch with version_tag
+          if [[ -n "${{ github.event.inputs.version_tag }}" ]]; then
+            VTAG="${{ github.event.inputs.version_tag }}"
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VTAG}"
+          fi
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
+          echo "computed tags: ${TAGS}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: geo-tools
+          file: geo-tools/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Image summary
+        run: |
+          echo "## geo-tools image built" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Tags pushed:" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          for t in $(echo "${{ steps.tags.outputs.tags }}" | tr ',' ' '); do
+            echo "- \`${t}\`" >> "${GITHUB_STEP_SUMMARY}"
+          done
