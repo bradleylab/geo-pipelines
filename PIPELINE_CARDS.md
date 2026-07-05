@@ -84,12 +84,15 @@ storage / `.sqsh` cost.
 per-recipe arguments — all validated (CRS as an authority code, compression /
 resampling enums, angle ranges).
 
-**Products.** One artifact per recipe:
+**Products.** One artifact per recipe (except `laz-to-dem`, which pairs a DTM
+with a DSM):
 - `tiff-to-cog` → Cloud-Optimized GeoTIFF (DEFLATE default)
 - `reproject` → reprojected raster
 - `hillshade` → hillshade raster
 - `laz-to-copc` → Cloud-Optimized Point Cloud (`.copc.laz`)
 - `reproject-laz` → reprojected LAS/LAZ
+- `laz-to-dem` → `dtm.tif` (SMRF-classified bare earth, IDW grid) + `dsm.tif`
+  (max-Z surface) into `--output-dir`
 
 **Run.** `geo-tools <recipe> --input <in> --output <out> [recipe args]`. No
 recipe accepts a free-form gdal/pdal string; commands run as an argv list.
@@ -100,11 +103,12 @@ recipe accepts a free-form gdal/pdal string; commands run as an argv list.
   COPC reader/writer, reprojection filter)
 
 **Known boundaries.**
-- `laz-to-dem` (ground-classified DEM from a point cloud) is deliberately NOT
-  here — it involves a real ground-classification methods choice and is deferred
-  to a later phase.
-- Recipes are single-input, single-output. Batch / mosaic workflows belong in an
-  analysis repo.
+- `laz-to-dem` fixes the ground-classification method to SMRF and the surfaces
+  to DTM (IDW) + DSM (max-Z). PMF, first-return DSMs, and gap-fill windows are
+  intentionally not exposed — add them only on a stated methods need.
+- Recipes are single-input. Most are single-output; `laz-to-dem` is the one
+  two-output recipe (DTM + DSM). Batch / mosaic workflows belong in an analysis
+  repo.
 
 **Lab status.** Active. v1 target: natural-language geoprocessing via `@atlas`
 (the Slack agent) on Compute2.
