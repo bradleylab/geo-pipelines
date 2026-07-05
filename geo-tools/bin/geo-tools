@@ -14,6 +14,7 @@ Recipes:
   hillshade       DEM     -> hillshade raster
   laz-to-copc     LAS/LAZ -> Cloud-Optimized Point Cloud (.copc.laz)
   reproject-laz   LAS/LAZ -> reprojected LAS/LAZ
+  laz-to-dem      LAS/LAZ -> DTM + DSM GeoTIFFs (SMRF ground classification)
 """
 
 from __future__ import annotations
@@ -164,6 +165,54 @@ def recipe_reproject_laz(a: argparse.Namespace) -> int:
     )
 
 
+def recipe_laz_to_dem(a: argparse.Namespace) -> int:
+    """Grid a point cloud into a bare-earth DTM and a surface DSM.
+
+    Ground is classified with SMRF (Simple Morphological Filter, Pingel et al.
+    2013) — the modern PDAL default, more robust than PMF on variable terrain.
+    The DTM keeps only ground returns (ASPRS class 2) and interpolates them onto
+    the grid with inverse-distance weighting; the DSM takes the maximum Z per
+    cell across all returns (the top surface — canopy/building tops). Both
+    inherit the input's CRS (no reprojection). Two files, ``dtm.tif`` and
+    ``dsm.tif``, are written into ``--output-dir``.
+    """
+    resolution = _bounded_float(a.resolution, "resolution", 0.05, 50.0)
+    input_path = _existing_input(a.input)
+    out_dir = Path(a.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # DTM: SMRF ground classification -> keep ground (class 2) -> IDW grid.
+    dtm_rc = _run(
+        [
+            "pdal",
+            "translate",
+            input_path,
+            str(out_dir / "dtm.tif"),
+            "smrf",
+            "range",
+            "--filters.range.limits=Classification[2:2]",
+            f"--writers.gdal.resolution={resolution}",
+            "--writers.gdal.output_type=idw",
+            "--writers.gdal.gdaldriver=GTiff",
+        ]
+    )
+    if dtm_rc != 0:
+        return dtm_rc
+
+    # DSM: highest Z per cell across all returns (no ground filter).
+    return _run(
+        [
+            "pdal",
+            "translate",
+            input_path,
+            str(out_dir / "dsm.tif"),
+            f"--writers.gdal.resolution={resolution}",
+            "--writers.gdal.output_type=max",
+            "--writers.gdal.gdaldriver=GTiff",
+        ]
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="geo-tools", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="recipe", required=True)
@@ -198,6 +247,19 @@ def build_parser() -> argparse.ArgumentParser:
     _io(p)
     p.add_argument("--target-crs", required=True, help="target CRS, e.g. EPSG:32615")
     p.set_defaults(func=recipe_reproject_laz)
+
+    p = sub.add_parser("laz-to-dem", help="LAS/LAZ -> DTM + DSM GeoTIFFs")
+    p.add_argument("--input", required=True, help="input LAS/LAZ path")
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        dest="output_dir",
+        help="directory for dtm.tif + dsm.tif outputs",
+    )
+    p.add_argument(
+        "--resolution", default="1.0", help="output grid resolution in CRS units (default 1.0)"
+    )
+    p.set_defaults(func=recipe_laz_to_dem)
 
     return parser
 

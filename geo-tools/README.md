@@ -8,8 +8,8 @@ command built from validated arguments, dispatched by the `geo-tools` CLI.
 
 The repo convention is **one pipeline per container**. This image is a
 deliberate, documented exception: it bundles several recipes (`tiff-to-cog`,
-`laz-to-copc`, `reproject`, `hillshade`, `reproject-laz`) because every one runs
-on the *exact same pinned GDAL+PDAL base*. Splitting them into per-recipe
+`laz-to-copc`, `reproject`, `hillshade`, `reproject-laz`, `laz-to-dem`) because
+every one runs on the *exact same pinned GDAL+PDAL base*. Splitting them into per-recipe
 containers would multiply the build time, GHCR storage, and Compute2 `.sqsh`
 cache N-fold for no functional gain — the recipes differ only by a few CLI
 arguments, not by environment. Each recipe is still a single, documented,
@@ -32,10 +32,16 @@ artifact-producing command, and none accepts a free-form gdal/pdal string.
 | `hillshade` | `gdaldem hillshade` | DEM → hillshade | `--z-factor` (1), `--azimuth` (315), `--altitude` (45) |
 | `laz-to-copc` | `pdal translate` | LAS/LAZ → `.copc.laz` | (none) |
 | `reproject-laz` | `pdal translate` | LAS/LAZ → reprojected LAS/LAZ | `--target-crs` (req) |
+| `laz-to-dem` | `pdal translate` (SMRF) | LAS/LAZ → `dtm.tif` + `dsm.tif` | `--output-dir` (req), `--resolution` (1.0) |
 
 Arguments are validated: CRS must be an authority code (e.g. `EPSG:32615`),
-compression/resampling are enums, and hillshade angles are range-checked.
-Invalid values are rejected before any tool runs.
+compression/resampling are enums, and hillshade angles and DEM resolution are
+range-checked. Invalid values are rejected before any tool runs.
+
+`laz-to-dem` classifies ground with SMRF (Pingel et al. 2013) and writes two
+GeoTIFFs into `--output-dir`: a bare-earth **DTM** (ground returns, ASPRS class
+2, inverse-distance-weighted onto the grid) and a **DSM** (maximum Z per cell
+across all returns). Both inherit the input CRS — no reprojection.
 
 ## Run
 
@@ -45,6 +51,7 @@ geo-tools reproject     --input in.tif  --output out.tif --target-crs EPSG:32615
 geo-tools hillshade     --input dem.tif --output hs.tif  --z-factor 1
 geo-tools laz-to-copc   --input in.laz  --output out.copc.laz
 geo-tools reproject-laz --input in.laz  --output out.laz --target-crs EPSG:32615
+geo-tools laz-to-dem    --input in.laz  --output-dir out/  --resolution 1.0
 ```
 
 ## How it is used
