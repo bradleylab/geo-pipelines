@@ -93,8 +93,14 @@ RUN pip install \
 # Using the host env (which has setuptools) avoids this.
 # ----------------------------------------------------------------------
 RUN pip install ninja
+
+# Pins tiny-cuda-nn to a fixed upstream commit (previously floated on
+# master HEAD, so a rebuild months later could silently pick up a
+# different tcnn). Bump by resolving
+# `git ls-remote https://github.com/NVlabs/tiny-cuda-nn HEAD` and updating TCNN_COMMIT.
+ARG TCNN_COMMIT=749dd70c5afc5a9dadb85e5652ed65d55e0ba187
 RUN pip install --no-build-isolation \
-        git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+        git+https://github.com/NVlabs/tiny-cuda-nn/@${TCNN_COMMIT}#subdirectory=bindings/torch
 
 # ----------------------------------------------------------------------
 # nerfstudio (training framework + ns-process-data + ns-export)
@@ -140,9 +146,20 @@ RUN GSPLAT_VERSION=$(pip show gsplat | awk '/^Version:/ {print $2}') \
 # Solution: editable install AND add /opt/hloc/third_party to PYTHONPATH
 # explicitly. Belt and braces — either alone is enough but combined
 # survives changes to hloc's __init__.
+#
+# Pins hloc to a fixed upstream commit (previously floated on master
+# HEAD). Bump by resolving
+# `git ls-remote https://github.com/cvg/Hierarchical-Localization HEAD`
+# and updating HLOC_COMMIT. Full (non-shallow) clone is required so an
+# arbitrary historical commit can be checked out; submodule init is run
+# explicitly after checkout since --recursive on the initial clone only
+# fetches submodules matching the tip, not our pinned commit.
 # ----------------------------------------------------------------------
-RUN git clone --recursive --depth 1 \
-        https://github.com/cvg/Hierarchical-Localization.git /opt/hloc \
+ARG HLOC_COMMIT=c13273bd0ecc2917a35910fd843712a1c6243193
+RUN git clone https://github.com/cvg/Hierarchical-Localization.git /opt/hloc \
+    && cd /opt/hloc \
+    && git checkout ${HLOC_COMMIT} \
+    && git submodule update --init --recursive \
     && pip install --no-build-isolation -e /opt/hloc \
     # hloc's deps resolve numpy unconstrained, which lets pip pull
     # numpy 2.x. Force back to 1.x last so torch + nerfstudio C-extensions
