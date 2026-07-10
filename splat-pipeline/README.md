@@ -43,7 +43,7 @@ One-time per pipeline version: import the GHCR image to a `.sqsh` cache.
 ```bash
 ssh pliny 'ssh c2 "
   enroot import \
-    -o /storage1/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+splat-pipeline+v1.sqsh \
+    -o /storage3/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+splat-pipeline+v1.sqsh \
     docker://ghcr.io#bradleylab/splat-pipeline:v1
 "'
 ```
@@ -54,9 +54,9 @@ Then run the pipeline by submitting the templates in
 ```bash
 # Stage 1: SfM (CPU, ~3-4 hr for a 5-min iPhone clip)
 sbatch --parsable --export=ALL,\
-INPUT_PATH=/storage1/fs1/.../my_video.mov,\
-OUTPUT_DIR=/storage1/fs1/.../processed/myplot,\
-IMG_SQSH=/storage1/fs1/.../bradleylab+splat-pipeline+v1.sqsh \
+INPUT_PATH=/storage3/fs1/.../my_video.mov,\
+OUTPUT_DIR=/storage3/fs1/.../processed/myplot,\
+IMG_SQSH=/storage3/fs1/.../bradleylab+splat-pipeline+v1.sqsh \
   scripts/slurm/sfm.sbatch
 ```
 

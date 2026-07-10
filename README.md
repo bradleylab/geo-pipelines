@@ -33,7 +33,7 @@ Actions workflow at `.github/workflows/build-<pipeline-name>.yml`. Never
 
 **Compute2 `.sqsh` files are caches, not source.** They are produced by
 `enroot import 'docker://ghcr.io#bradleylab/<pipeline>:<tag>'` and live on
-RIS storage at `/storage1/fs1/<user>/Active/c2_jobs/`. They can be deleted
+RIS storage at `/storage3/fs1/<user>/Active/c2_jobs/`. They can be deleted
 whenever space is tight; the canonical recipe + image lives in this repo
 + GHCR.
 
@@ -74,7 +74,7 @@ Compute2 pattern (per `~/.claude/rules/research-infrastructure.md`):
 # 1. One-time per pipeline version: import GHCR image to a per-host .sqsh cache
 ssh pliny 'ssh c2 "
   enroot import \
-    -o /storage1/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+splat-pipeline+v1.sqsh \
+    -o /storage3/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+splat-pipeline+v1.sqsh \
     'docker://ghcr.io#bradleylab/splat-pipeline:v1'
 "'
 
