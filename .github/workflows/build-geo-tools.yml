@@ -62,7 +62,29 @@ jobs:
           echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
           echo "computed tags: ${TAGS}"
 
-      - name: Build and push
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: geo-tools
+          file: geo-tools/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Recipe smoke tests
+        # Exercises every recipe end-to-end against synthetic fixtures inside
+        # the just-built image. A failing recipe stops the job here, before
+        # the "Push image" step below ever runs.
+        run: |
+          IMAGE="$(cut -d, -f1 <<<"${{ steps.tags.outputs.tags }}")"
+          docker run --rm \
+            -v "${{ github.workspace }}/geo-tools/tests:/tests:ro" \
+            --entrypoint bash \
+            "${IMAGE}" /tests/run_recipe_smoke.sh
+
+      - name: Push image
         uses: docker/build-push-action@v5
         with:
           context: geo-tools
@@ -70,7 +92,6 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       - name: Image summary
         run: |
