@@ -2,6 +2,7 @@ name: build geo-tools
 
 # Builds and pushes ghcr.io/bradleylab/geo-tools.
 # Triggers:
+#   - pull requests touching geo-tools/** -> build + smoke only (no push)
 #   - push to main when geo-tools/** changes -> :latest
 #   - tag matching geo-tools-v* -> :vN and :latest
 #   - manual dispatch with a version_tag input
@@ -14,6 +15,10 @@ on:
       - '.github/workflows/build-geo-tools.yml'
     tags:
       - 'geo-tools-v*'
+  pull_request:
+    paths:
+      - 'geo-tools/**'
+      - '.github/workflows/build-geo-tools.yml'
   workflow_dispatch:
     inputs:
       version_tag:
@@ -85,6 +90,7 @@ jobs:
             "${IMAGE}" /tests/run_recipe_smoke.sh
 
       - name: Push image
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: geo-tools
@@ -94,6 +100,7 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
 
       - name: Image summary
+        if: github.event_name != 'pull_request'
         run: |
           echo "## geo-tools image built" >> "${GITHUB_STEP_SUMMARY}"
           echo "" >> "${GITHUB_STEP_SUMMARY}"
