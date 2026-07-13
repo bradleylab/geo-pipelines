@@ -15,8 +15,8 @@ export PYTHONPATH="${ISCE_HOME}/..:${PYTHONPATH:-}"
 
 case "${1:-}" in
   version | "")
-    python -c "import isce, mintpy, importlib.metadata as im; \
-print('isce2', im.version('isce2'), '| mintpy', im.version('mintpy'))"
+    python -c "import isce, mintpy; print('isce2 + mintpy import OK')"
+    micromamba list -n base 2>/dev/null | grep -iE "isce2|mintpy" || true
     echo "ISCE_HOME=${ISCE_HOME}"
     ;;
   *)
