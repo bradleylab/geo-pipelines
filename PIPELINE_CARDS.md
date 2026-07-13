@@ -112,3 +112,54 @@ recipe accepts a free-form gdal/pdal string; commands run as an argv list.
 
 **Lab status.** Active. v1 target: natural-language geoprocessing via `@atlas`
 (the Slack agent) on Compute2.
+
+---
+
+## snap-insar
+
+**Purpose.** Sentinel-1 InSAR via ESA SNAP 12 + the Sentinel-1 Toolbox:
+TOPS coregistration → interferogram → **coherence** → Goldstein filtering →
+SNAPHU export/unwrap. Coherence loss localizes surface disturbance
+(scour, bank failure, sediment reworking) better than backscatter.
+
+**Inputs.** Two co-orbit S1 IW **SLC** products (same relative orbit) + a DEM
+(SNAP auto-fetches SRTM/Copernicus). First use: the ascending 6-day Black River
+pair (2026-07-05 / 2026-07-11).
+
+**Products.** `.dim`/`.data` with a coherence band + interferogram; GeoTIFF via
+a final `Write`.
+
+**Stack.** `debian:bookworm-slim` + ESA SNAP 12.0.0 (official installer, bundled
+JRE). amd64, CPU. SNAPHU (unwrapping) not bundled; coherence doesn't need it. SNAP 12 pinned for Sentinel-1C/1D support (SNAP 9
+predates them).
+
+**Run.** `snap-insar gpt <graph.xml> -P...=... -c <heap>`. Update checks
+disabled for batch.
+
+**Known boundaries.** Orbit/DEM fetch are run-time (network) steps. GPU not used.
+
+**Lab status.** New (2026-07). First target: Black River flood coherence map.
+
+---
+
+## isce2-insar
+
+**Purpose.** Sentinel-1 InSAR (interferogram + **coherence**) via ISCE2 (JPL),
+with MintPy for optional time-series. Alternative/cross-check to `snap-insar`;
+ISCE2 shines for multi-date stacks.
+
+**Inputs.** Two (or more) co-orbit S1 IW **SLC** products + orbits + a DEM.
+
+**Products.** `merged/topophase.cor` (coherence), `merged/filt_topophase.flat`
+(filtered interferogram), geocoded outputs.
+
+**Stack.** `mambaorg/micromamba:1.5.10` + `isce2` + `mintpy` from conda-forge.
+CPU (GPU modules not built). Entrypoint sets `ISCE_HOME`/`PATH` at run time
+(Compute2 `srun bash -lc` bypasses conda activation).
+
+**Run.** `isce2-insar topsApp.py topsApp.xml --steps`;
+`isce2-insar smallbaselineApp.py <cfg>` for time series.
+
+**Known boundaries.** Orbit/DEM fetch are run-time steps. GPU not built.
+
+**Lab status.** New (2026-07). Cross-check for the Black River coherence map.

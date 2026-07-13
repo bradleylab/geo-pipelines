@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Dispatch for the isce2-insar image.
+#
+# Sets the ISCE runtime env (conda activation is bypassed by `srun bash -lc`
+# on Compute2), then runs the given ISCE/MintPy command, e.g.:
+#   isce2-insar version
+#   isce2-insar topsApp.py topsApp.xml --steps
+#   isce2-insar smallbaselineApp.py smallbaselineApp.cfg
+set -euo pipefail
+
+ISCE_HOME="$(python -c 'import os, isce; print(os.path.dirname(isce.__file__))')"
+export ISCE_HOME
+export PATH="${ISCE_HOME}/applications:${ISCE_HOME}/bin:/opt/conda/bin:${PATH}"
+export PYTHONPATH="${ISCE_HOME}/..:${PYTHONPATH:-}"
+
+case "${1:-}" in
+  version | "")
+    python -c "import isce, mintpy; print('isce2 + mintpy import OK')"
+    micromamba list -n base 2>/dev/null | grep -iE "isce2|mintpy" || true
+    echo "ISCE_HOME=${ISCE_HOME}"
+    ;;
+  *)
+    exec "$@"
+    ;;
+esac
