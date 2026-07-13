@@ -8,16 +8,22 @@
 #   isce2-insar smallbaselineApp.py smallbaselineApp.cfg
 set -euo pipefail
 
+# On Compute2, `srun ... bash -lc` runs a login shell that re-sources the
+# profile and drops the image's /opt/conda/bin (micromamba base env) from PATH,
+# so `python` is not found. Restore it before the interpreter is first used.
+export PATH="/opt/conda/bin:${PATH}"
+
 ISCE_HOME="$(python -c 'import os, isce; print(os.path.dirname(isce.__file__))')"
 export ISCE_HOME
-export PATH="${ISCE_HOME}/applications:${ISCE_HOME}/bin:/opt/conda/bin:${PATH}"
+export PATH="${ISCE_HOME}/applications:${ISCE_HOME}/bin:${PATH}"
 export PYTHONPATH="${ISCE_HOME}/..:${PYTHONPATH:-}"
 
 case "${1:-}" in
   version | "")
     python -c "import isce, mintpy; print('isce2 + mintpy import OK')"
-    micromamba list -n base 2>/dev/null | grep -iE "isce2|mintpy" || true
     echo "ISCE_HOME=${ISCE_HOME}"
+    command -v topsApp.py smallbaselineApp.py || true
+    micromamba list -n base 2>/dev/null | grep -iE "isce2|mintpy" || true
     ;;
   *)
     exec "$@"
