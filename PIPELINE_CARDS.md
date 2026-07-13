@@ -130,7 +130,7 @@ pair (2026-07-05 / 2026-07-11).
 a final `Write`.
 
 **Stack.** `debian:bookworm-slim` + ESA SNAP 12.0.0 (official installer, bundled
-JRE) + `snaphu`. amd64, CPU. SNAP 12 pinned for Sentinel-1C/1D support (SNAP 9
+JRE). amd64, CPU. SNAPHU (unwrapping) not bundled; coherence doesn't need it. SNAP 12 pinned for Sentinel-1C/1D support (SNAP 9
 predates them).
 
 **Run.** `snap-insar gpt <graph.xml> -P...=... -c <heap>`. Update checks

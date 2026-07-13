@@ -14,7 +14,8 @@ SNAP **12** is pinned because it supports Sentinel-1C/1D (SNAP 9 predates them).
 
 - Base: `debian:bookworm-slim`
 - ESA SNAP 12.0.0 (official installer, bundled JRE) at `/opt/snap`
-- `snaphu` (Debian) for phase unwrapping
+- SNAPHU (phase unwrapping) **not bundled** — not in bookworm apt, and coherence
+  doesn't need it. Add via conda-forge / source only if unwrapping is required.
 
 ## Run
 

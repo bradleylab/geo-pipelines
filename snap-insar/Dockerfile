@@ -12,8 +12,11 @@ ARG SNAP_VERSION=12.0.0
 ARG SNAP_URL=https://download.esa.int/step/snap/12.0/installers/esa-snap_all_linux-12.0.0.sh
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget ca-certificates snaphu \
+        wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+# Note: SNAPHU (phase unwrapping) is NOT bundled — it isn't in bookworm apt and
+# coherence/interferogram (our target) don't need it. Add via conda-forge or a
+# source build only if unwrapped displacement is required later.
 
 # Headless (unattended) install to /opt/snap via the install4j response varfile.
 COPY response.varfile /tmp/response.varfile
@@ -29,9 +32,7 @@ ENV PATH=/opt/snap/bin:$PATH
 COPY bin/snap-insar /usr/local/bin/snap-insar
 RUN chmod +x /usr/local/bin/snap-insar
 
-# Offline build smoke test: gpt initialises its module graph and prints help
-# (exits 0). snaphu resolves on PATH for the unwrap step.
-RUN /opt/snap/bin/gpt -h >/dev/null && echo "SNAP ${SNAP_VERSION} gpt OK" \
-    && command -v snaphu
+# Offline build smoke test: gpt initialises its module graph and prints help.
+RUN /opt/snap/bin/gpt -h >/dev/null && echo "SNAP ${SNAP_VERSION} gpt OK"
 
 ENTRYPOINT ["/usr/local/bin/snap-insar"]

@@ -9,7 +9,6 @@ case "${1:-}" in
   version | "")
     /opt/snap/bin/gpt -h 2>/dev/null | head -1 || true
     cat /opt/snap/snap/VERSION.txt 2>/dev/null || echo "SNAP 12.0.0"
-    command -v snaphu && snaphu --help 2>&1 | head -1 || true
     ;;
   *)
     exec "$@"
