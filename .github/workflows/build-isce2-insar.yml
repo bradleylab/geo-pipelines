@@ -1,0 +1,81 @@
+name: build isce2-insar
+
+# Builds and pushes ghcr.io/bradleylab/isce2-insar.
+#   - PRs touching isce2-insar/**  -> build + smoke only (no push)
+#   - push to main                 -> :latest
+#   - tag isce2-insar-v*           -> :vN and :latest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'isce2-insar/**'
+      - '.github/workflows/build-isce2-insar.yml'
+    tags:
+      - 'isce2-insar-v*'
+  pull_request:
+    paths:
+      - 'isce2-insar/**'
+      - '.github/workflows/build-isce2-insar.yml'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Stable version tag (e.g. v1) — empty = latest only'
+        required: false
+        default: ''
+
+env:
+  IMAGE_NAME: bradleylab/isce2-insar
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute tags
+        id: tags
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          if [[ "${GITHUB_REF}" == refs/tags/isce2-insar-v* ]]; then
+            VTAG="${GITHUB_REF#refs/tags/isce2-insar-}"
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VTAG}"
+          fi
+          if [[ -n "${{ github.event.inputs.version_tag }}" ]]; then
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.version_tag }}"
+          fi
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
+          echo "computed tags: ${TAGS}"
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: isce2-insar
+          file: isce2-insar/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+      - name: Smoke test
+        run: |
+          IMAGE="$(cut -d, -f1 <<<"${{ steps.tags.outputs.tags }}")"
+          docker run --rm "${IMAGE}" version
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: isce2-insar
+          file: isce2-insar/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache

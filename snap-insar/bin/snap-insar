@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Dispatch for the snap-insar image. Runs SNAP's gpt (Graph Processing Tool) or
+# a small helper. On Compute2:
+#   srun ... bash -lc "snap-insar gpt <graph.xml> -Pin1=... -Pcoh=... -c 8G"
+set -euo pipefail
+export PATH=/opt/snap/bin:$PATH
+
+case "${1:-}" in
+  version | "")
+    /opt/snap/bin/gpt -h 2>/dev/null | head -1 || true
+    cat /opt/snap/snap/VERSION.txt 2>/dev/null || echo "SNAP 12.0.0"
+    command -v snaphu && snaphu --help 2>&1 | head -1 || true
+    ;;
+  *)
+    exec "$@"
+    ;;
+esac

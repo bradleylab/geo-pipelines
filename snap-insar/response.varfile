@@ -1,0 +1,5 @@
+# install4j response file for an unattended ESA SNAP install (used with `-q`).
+# Minimal by design: set the install dir; `-q` takes defaults for everything
+# else (all toolboxes, incl. the Sentinel-1 Toolbox needed for InSAR).
+sys.languageId=en
+sys.installationDir=/opt/snap
