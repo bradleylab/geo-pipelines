@@ -77,8 +77,8 @@ wrapper over the official `opendronemap/odm` image.
   comes from image GPS EXIF (~1–3 m).
 
 **Products** (collected flat into `--output`):
-- `orthophoto.tif` — COG orthomosaic
-- `dsm.tif`, `dtm.tif` — surface / terrain models (COG)
+- `orthophoto.cog.tif` — Cloud-Optimized GeoTIFF orthomosaic
+- `dsm.cog.tif`, `dtm.cog.tif` — surface / terrain models (COG)
 - `point_cloud.laz` — dense georeferenced point cloud
 - `report.pdf` — ODM processing report
 
