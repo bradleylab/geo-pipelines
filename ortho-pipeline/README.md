@@ -14,7 +14,7 @@ templates.
 | | |
 |---|---|
 | Input | Directory of overlapping images (`.jpg`, `.png`, `.tif`); optional ODM `gcp_list.txt` |
-| Output | `orthophoto.tif` (COG), `dsm.tif`, `dtm.tif`, `point_cloud.laz`, `report.pdf` |
+| Output | `orthophoto.cog.tif`, `dsm.cog.tif`, `dtm.cog.tif` (all Cloud-Optimized GeoTIFF), `point_cloud.laz`, `report.pdf` |
 
 ## Georeferencing
 

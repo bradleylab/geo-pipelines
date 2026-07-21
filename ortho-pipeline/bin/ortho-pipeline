@@ -27,11 +27,14 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 RUN_PY = "/code/run.py"
 PROJECT_NAME = "odm"
 
-# (ODM product relative path, collected output name)
+# (ODM product relative path, collected output name). Rasters use the .cog.tif
+# suffix — this pipeline always runs ODM with --cog, so every GeoTIFF it emits
+# is a Cloud-Optimized GeoTIFF; the extension advertises that (parallel to the
+# lab's .copc.laz convention for point clouds).
 PRODUCTS = [
-    ("odm_orthophoto/odm_orthophoto.tif", "orthophoto.tif"),
-    ("odm_dem/dsm.tif", "dsm.tif"),
-    ("odm_dem/dtm.tif", "dtm.tif"),
+    ("odm_orthophoto/odm_orthophoto.tif", "orthophoto.cog.tif"),
+    ("odm_dem/dsm.tif", "dsm.cog.tif"),
+    ("odm_dem/dtm.tif", "dtm.cog.tif"),
     ("odm_georeferencing/odm_georeferenced_model.laz", "point_cloud.laz"),
     ("odm_report/report.pdf", "report.pdf"),
 ]
@@ -102,7 +105,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             shutil.copy(src, output_dir / name)
             collected.append(name)
     print(f"collected -> {output_dir}: {', '.join(collected) or '(none found!)'}", flush=True)
-    if "orthophoto.tif" not in collected:
+    if "orthophoto.cog.tif" not in collected:
         raise SystemExit("error: ODM finished but no orthophoto was produced")
 
 
