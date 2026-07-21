@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""ortho-pipeline: drone image directory -> orthophoto + DSM/DTM + point cloud.
+
+Thin CLI over OpenDroneMap's run.py. Sets up an ODM project (images, optional
+GCP file), runs the ODM chain with lab defaults, and collects the products into
+a flat output directory with predictable names.
+
+    ortho-pipeline run --images <dir> --output <dir> [--gcp <gcp_list.txt>] \
+        [--resolution CM_PER_PX] [--no-dsm] [--no-dtm] [--extra "..."]
+
+Georeferencing: if --gcp is given (an ODM gcp_list.txt with image-pixel marks),
+ODM uses the ground control points; otherwise it falls back to the images'
+onboard GPS EXIF (~1-3 m absolute accuracy). GPS-only is fine for planform
+orthophotos; use GCPs for survey-grade absolute accuracy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+RUN_PY = "/code/run.py"
+PROJECT_NAME = "odm"
+
+# (ODM product relative path, collected output name)
+PRODUCTS = [
+    ("odm_orthophoto/odm_orthophoto.tif", "orthophoto.tif"),
+    ("odm_dem/dsm.tif", "dsm.tif"),
+    ("odm_dem/dtm.tif", "dtm.tif"),
+    ("odm_georeferencing/odm_georeferenced_model.laz", "point_cloud.laz"),
+    ("odm_report/report.pdf", "report.pdf"),
+]
+
+
+def run(cmd: list[str]) -> None:
+    print(f"$ {' '.join(cmd)}", flush=True)
+    if subprocess.run(cmd, check=False).returncode != 0:
+        raise SystemExit("ODM command failed")
+
+
+def list_images(images_dir: Path) -> list[Path]:
+    imgs = sorted(p for p in images_dir.iterdir()
+                  if p.suffix.lower() in IMAGE_SUFFIXES)
+    if not imgs:
+        raise SystemExit(f"error: no images ({sorted(IMAGE_SUFFIXES)}) in {images_dir}")
+    return imgs
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    images_dir = Path(args.images).resolve()
+    output_dir = Path(args.output).resolve()
+    project_path = Path(args.project_path).resolve()
+    if not images_dir.is_dir():
+        raise SystemExit(f"error: --images {images_dir} is not a directory")
+
+    imgs = list_images(images_dir)
+    proj = project_path / PROJECT_NAME
+    proj_images = proj / "images"
+    proj_images.mkdir(parents=True, exist_ok=True)
+    # symlink source images into the project (avoids copying GBs; source stays RO)
+    for src in imgs:
+        link = proj_images / src.name
+        if not link.exists():
+            link.symlink_to(src)
+    print(f"prepared {len(imgs)} images in {proj_images}", flush=True)
+
+    if args.gcp:
+        gcp_src = Path(args.gcp).resolve()
+        if not gcp_src.is_file():
+            raise SystemExit(f"error: --gcp {gcp_src} not found")
+        shutil.copy(gcp_src, proj / "gcp_list.txt")
+        print(f"using GCP file {gcp_src} (ground-control georeferencing)", flush=True)
+    else:
+        print("no GCP file — georeferencing from image GPS EXIF (~1-3 m)", flush=True)
+
+    cmd = ["python3", RUN_PY, "--project-path", str(project_path)]
+    if args.dsm:
+        cmd.append("--dsm")
+    if args.dtm:
+        cmd.append("--dtm")
+    if args.resolution is not None:
+        cmd += ["--orthophoto-resolution", str(args.resolution)]
+    cmd += ["--pc-quality", args.pc_quality,
+            "--feature-quality", args.feature_quality,
+            "--max-concurrency", str(args.max_concurrency),
+            "--cog", "--auto-boundary"]
+    if args.extra:
+        cmd += args.extra.split()
+    cmd.append(PROJECT_NAME)
+    run(cmd)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    collected = []
+    for rel, name in PRODUCTS:
+        src = proj / rel
+        if src.exists():
+            shutil.copy(src, output_dir / name)
+            collected.append(name)
+    print(f"collected -> {output_dir}: {', '.join(collected) or '(none found!)'}", flush=True)
+    if "orthophoto.tif" not in collected:
+        raise SystemExit("error: ODM finished but no orthophoto was produced")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", required=True)
+    r = sub.add_parser("run", help="images -> ortho + DSM/DTM + point cloud")
+    r.add_argument("--images", required=True, help="directory of drone images")
+    r.add_argument("--output", required=True, help="directory for collected products")
+    r.add_argument("--gcp", help="ODM gcp_list.txt (optional; else GPS EXIF)")
+    r.add_argument("--project-path", default="/work", help="ODM working dir (default /work)")
+    r.add_argument("--resolution", type=float, default=None,
+                   help="orthophoto resolution cm/px (default: ODM auto from GSD)")
+    r.add_argument("--pc-quality", default="medium",
+                   choices=["ultra", "high", "medium", "low", "lowest"])
+    r.add_argument("--feature-quality", default="high",
+                   choices=["ultra", "high", "medium", "low", "lowest"])
+    r.add_argument("--max-concurrency", type=int, default=int(os.environ.get("NPROC", "16")))
+    r.add_argument("--extra", default="", help="extra flags passed through to ODM run.py")
+    dsm = r.add_mutually_exclusive_group()
+    dsm.add_argument("--dsm", dest="dsm", action="store_true", default=True)
+    dsm.add_argument("--no-dsm", dest="dsm", action="store_false")
+    dtm = r.add_mutually_exclusive_group()
+    dtm.add_argument("--dtm", dest="dtm", action="store_true", default=True)
+    dtm.add_argument("--no-dtm", dest="dtm", action="store_false")
+    r.set_defaults(func=cmd_run)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
