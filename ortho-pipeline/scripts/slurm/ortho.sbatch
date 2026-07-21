@@ -35,7 +35,12 @@ set -euo pipefail
 : "${FEATURE_QUALITY:=high}"
 : "${EXTRA:=}"
 
-mkdir -p "${OUTPUT_DIR}" logs
+# ODM's working dir (project + all intermediates, tens of GB) must live on
+# storage, not the ephemeral container overlay. Put it next to OUTPUT_DIR so the
+# already-mounted OUTPUT_PARENT covers it, and use it as the container workdir
+# (the ODM image has no /work).
+WORK="${OUTPUT_DIR}_work"
+mkdir -p "${OUTPUT_DIR}" "${WORK}" logs
 
 # Mount input and output parents so paths resolve inside the container.
 IMAGES_PARENT=$(dirname "${IMAGES}")
@@ -43,7 +48,7 @@ OUTPUT_PARENT=$(dirname "${OUTPUT_DIR}")
 MOUNTS="${IMAGES_PARENT}:${IMAGES_PARENT},${OUTPUT_PARENT}:${OUTPUT_PARENT}"
 
 # Build the wrapper args.
-ARGS=(run --images "${IMAGES}" --output "${OUTPUT_DIR}"
+ARGS=(run --images "${IMAGES}" --output "${OUTPUT_DIR}" --project-path "${WORK}"
       --pc-quality "${PC_QUALITY}" --feature-quality "${FEATURE_QUALITY}"
       --max-concurrency "${SLURM_CPUS_PER_TASK}")
 [[ -n "${RESOLUTION}" ]] && ARGS+=(--resolution "${RESOLUTION}")
@@ -54,8 +59,11 @@ if [[ -n "${GCP}" ]]; then
 fi
 [[ -n "${EXTRA}" ]] && ARGS+=(--extra "${EXTRA}")
 
+# PYTHONNOUSERSITE=1 stops the host's ~/.local site-packages (enroot mounts the
+# host $HOME) from shadowing the container's numpy/rasterio and breaking their
+# ABI. Set inside the container so it holds regardless of env propagation.
 srun \
     --container-image="${IMG_SQSH}" \
     --container-mounts="${MOUNTS}" \
-    --container-workdir=/work \
-    ortho-pipeline "${ARGS[@]}"
+    --container-workdir="${WORK}" \
+    bash -lc 'export PYTHONNOUSERSITE=1; exec ortho-pipeline "$@"' _ "${ARGS[@]}"

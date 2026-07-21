@@ -10,6 +10,10 @@
 
 FROM opendronemap/odm:3.5.6
 
+# Guard against a host ~/.local (bind-mounted $HOME under enroot/pyxis) shadowing
+# the image's numpy and breaking its ABI against compiled rasterio/GDAL.
+ENV PYTHONNOUSERSITE=1
+
 # Wrapper CLI. ODM's own entrypoint is /code/run.py; we call it from here.
 COPY bin/ortho-pipeline /usr/local/bin/ortho-pipeline
 RUN chmod +x /usr/local/bin/ortho-pipeline
