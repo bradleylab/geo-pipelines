@@ -66,9 +66,39 @@ TLS-anchored visualization figures.
 
 ## ortho-pipeline
 
-*Planned.* Drone imagery → orthophoto + DEM via OpenDroneMap.
+**Purpose.** Turn a directory of overlapping drone images into a georeferenced
+orthophoto plus DSM, DTM, and dense point cloud, via OpenDroneMap. Thin CLI
+wrapper over the official `opendronemap/odm` image.
 
-(Card to be filled in when the pipeline is built.)
+**Inputs.**
+- `--images <dir>` — overlapping images (`.jpg`, `.png`, `.tif`).
+- `--gcp <gcp_list.txt>` — optional ODM ground-control file (projection line +
+  `geo_x geo_y geo_z im_x im_y image_name` rows). Without it, georeferencing
+  comes from image GPS EXIF (~1–3 m).
+
+**Products** (collected flat into `--output`):
+- `orthophoto.tif` — COG orthomosaic
+- `dsm.tif`, `dtm.tif` — surface / terrain models (COG)
+- `point_cloud.laz` — dense georeferenced point cloud
+- `report.pdf` — ODM processing report
+
+**Run.** `ortho-pipeline run --images <dir> --output <dir> [--gcp ...]
+[--resolution CM] [--pc-quality ...] [--feature-quality ...] [--no-dsm]
+[--no-dtm] [--extra "<ODM flags>"]`. Single stage (ODM runs the whole chain).
+
+**Stack.** Base `opendronemap/odm:3.5.6` (OpenSfM + MVS + meshing +
+orthorectification + GDAL/PDAL). CPU-only; the upstream `:gpu` variant (GPU
+SIFT) is not used.
+
+**Known boundaries.**
+- Does NOT create GCP image-marks — consumes a ready `gcp_list.txt` only. World
+  coordinates alone are insufficient; GCPs must be marked in ≥3 images (WebODM /
+  POSM GCP tool).
+- Not splats/NeRF (use `splat-pipeline`); no multispectral indices or
+  radiometric calibration.
+
+**Lab status.** New (2026-07). First target: the 2026-07-16 Johnson's Shut-Ins
+Phantom 4 Pro flights (two sites: shut-ins gorge + north day-use area).
 
 ---
 
