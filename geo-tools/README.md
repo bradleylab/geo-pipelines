@@ -8,12 +8,13 @@ command built from validated arguments, dispatched by the `geo-tools` CLI.
 
 The repo convention is **one pipeline per container**. This image is a
 deliberate, documented exception: it bundles several recipes (`tiff-to-cog`,
-`laz-to-copc`, `reproject`, `hillshade`, `reproject-laz`, `laz-to-dem`) because
-every one runs on the *exact same pinned GDAL+PDAL base*. Splitting them into per-recipe
-containers would multiply the build time, GHCR storage, and Compute2 `.sqsh`
-cache N-fold for no functional gain — the recipes differ only by a few CLI
-arguments, not by environment. Each recipe is still a single, documented,
-artifact-producing command, and none accepts a free-form gdal/pdal string.
+`laz-to-copc`, `reproject`, `hillshade`, `reproject-laz`, `laz-to-dem`,
+`dem-of-difference`) because every one runs on the *exact same pinned GDAL+PDAL
+base*. Splitting them into per-recipe containers would multiply the build time,
+GHCR storage, and Compute2 `.sqsh` cache N-fold for no functional gain — the
+recipes differ only by a few CLI arguments, not by environment. Each recipe is
+still a single, documented, artifact-producing command, and none accepts a
+free-form gdal/pdal string.
 
 ## Base image and versions
 
@@ -33,6 +34,7 @@ artifact-producing command, and none accepts a free-form gdal/pdal string.
 | `laz-to-copc` | `pdal translate` | LAS/LAZ → `.copc.laz` | (none) |
 | `reproject-laz` | `pdal translate` | LAS/LAZ → reprojected LAS/LAZ | `--target-crs` (req) |
 | `laz-to-dem` | `pdal translate` (SMRF) | LAS/LAZ → `dtm.tif` + `dsm.tif` | `--output-dir` (req), `--resolution` (1.0) |
+| `dem-of-difference` | `gdalwarp` + GDAL/numpy | two DEMs → `dod.tif` + stats + histogram | `--after`/`--before`/`--output-dir` (req), `--threshold` (0), `--resampling` (bilinear) |
 
 Arguments are validated: CRS must be an authority code (e.g. `EPSG:32615`),
 compression/resampling are enums, and hillshade angles and DEM resolution are
@@ -43,6 +45,28 @@ GeoTIFFs into `--output-dir`: a bare-earth **DTM** (ground returns, ASPRS class
 2, inverse-distance-weighted onto the grid) and a **DSM** (maximum Z per cell
 across all returns). Both inherit the input CRS — no reprojection.
 
+`dem-of-difference` measures how much the ground moved between two surveys of
+the same place: give it the later elevation surface as `--after` and the earlier
+one as `--before`, and it reports where the surface rose, where it fell, and how
+much material that adds up to. Use it for a park DTM from 2024 against one from
+2022, or a river reach before and after a flood.
+
+The later surface sets the output grid; the earlier one is resampled onto it, so
+the two line up cell for cell. Four files land in `--output-dir`: `dod.tif`
+(elevation change per cell, later minus earlier, in meters — positive where the
+surface rose), `dod_stats.json` (how many cells changed, over what area, the
+mean and spread of the change, and the gained, lost, and net volumes in cubic
+meters), `dod_hist.csv` (the distribution of elevation change, in 100 bins), and
+`before_aligned.tif` (the resampled earlier surface, kept so the subtraction can
+be checked).
+
+`--threshold` is the smallest elevation change worth believing, in meters. Cells
+that moved by no more than that are left out of the change counts and the
+volumes — the usual way to keep survey noise out of a volume estimate (Wheaton
+et al. 2010). It defaults to 0, which counts every changed cell. Both surfaces
+must already be in a projected CRS in meters, since areas and volumes are
+computed from the grid's own cell size; run `reproject` first if they are not.
+
 ## Run
 
 ```bash
@@ -52,6 +76,7 @@ geo-tools hillshade     --input dem.tif --output hs.tif  --z-factor 1
 geo-tools laz-to-copc   --input in.laz  --output out.copc.laz
 geo-tools reproject-laz --input in.laz  --output out.laz --target-crs EPSG:32615
 geo-tools laz-to-dem    --input in.laz  --output-dir out/  --resolution 1.0
+geo-tools dem-of-difference --after 2024.tif --before 2022.tif --output-dir out/ --threshold 0.1
 ```
 
 ## How it is used

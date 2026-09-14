@@ -2,7 +2,7 @@
 #
 # KITCHEN-SINK EXCEPTION (per geo-pipelines/README.md "one pipeline per container"):
 # this image intentionally bundles several bounded recipes (tiff->COG, laz->COPC,
-# reproject, hillshade) instead of one-per-container. Reason: every recipe runs on
+# reproject, hillshade, DEM of difference) instead of one-per-container. Reason: every recipe runs on
 # the exact same pinned GDAL+PDAL base, so splitting would multiply the build,
 # storage, and Compute2 .sqsh cost N-fold for no functional gain. Each recipe is
 # still a single documented artifact-producing command dispatched by bin/geo-tools,
@@ -39,8 +39,11 @@ COPY bin/geo-tools /usr/local/bin/geo-tools
 
 # Offline build smoke test: python bindings import, the COG driver is present,
 # both CLIs resolve, and the recipe dispatcher parses. No network, no data.
+# numpy is checked explicitly: dem-of-difference subtracts two rasters through
+# the GDAL Python bindings, which is what conda-forge's gdal package pulls numpy
+# in for — an image without it would fail at run time instead of here.
 RUN chmod +x /usr/local/bin/geo-tools \
-    && python -c "from osgeo import gdal; import pdal; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'; print('python bindings ok')" \
+    && python -c "from osgeo import gdal; import pdal; import numpy; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'; print('python bindings ok, numpy', numpy.__version__)" \
     && gdal_translate --version \
     && pdal --version \
     && geo-tools --help >/dev/null \
@@ -51,5 +54,5 @@ ENTRYPOINT ["geo-tools"]
 CMD ["--help"]
 
 LABEL org.opencontainers.image.source="https://github.com/bradleylab/geo-pipelines"
-LABEL org.opencontainers.image.description="bounded GDAL/PDAL geoprocessing recipes — tiff->COG, laz->COPC, reproject, hillshade"
+LABEL org.opencontainers.image.description="bounded GDAL/PDAL geoprocessing recipes — tiff->COG, laz->COPC, reproject, hillshade, DEM of difference"
 LABEL org.opencontainers.image.licenses="Apache-2.0"

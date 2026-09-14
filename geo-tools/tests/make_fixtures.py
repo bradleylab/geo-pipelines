@@ -31,6 +31,17 @@ RASTER_FILL_VALUE = 100
 POINTS_BOUNDS = "([0,50],[0,50],[0,20])"
 POINTS_COUNT = 500
 
+# A pair of elevation surfaces for the dem-of-difference recipe. That recipe
+# refuses a geographic CRS, so these use UTM 15N (metric, covers St. Louis)
+# rather than the EPSG:4326 grid above. Both are flat and constant so the
+# expected difference is exact: every cell is 101.5 - 100.0 = 1.5 m, which the
+# smoke test checks against the volume and changed-cell statistics.
+DEM_EPSG = 32615
+DEM_ORIGIN_EASTING_NORTHING = (734600.0, 4281200.0)  # upper-left corner
+DEM_PIXEL_METERS = 1.0
+DEM_BEFORE_ELEVATION = 100.0
+DEM_AFTER_ELEVATION = 101.5
+
 
 def make_raster(path: Path) -> None:
     driver = gdal.GetDriverByName("GTiff")
@@ -47,6 +58,24 @@ def make_raster(path: Path) -> None:
     dataset = None
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"failed to create raster fixture at {path}")
+
+
+def make_dem(path: Path, elevation: float) -> None:
+    """Write a flat Float32 elevation surface on the shared UTM 15N grid."""
+    driver = gdal.GetDriverByName("GTiff")
+    dataset = driver.Create(str(path), RASTER_SIZE, RASTER_SIZE, 1, gdal.GDT_Float32)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(DEM_EPSG)
+    dataset.SetProjection(srs.ExportToWkt())
+    ulx, uly = DEM_ORIGIN_EASTING_NORTHING
+    dataset.SetGeoTransform([ulx, DEM_PIXEL_METERS, 0, uly, 0, -DEM_PIXEL_METERS])
+    band = dataset.GetRasterBand(1)
+    band.Fill(elevation)
+    band.FlushCache()
+    dataset.FlushCache()
+    dataset = None
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"failed to create DEM fixture at {path}")
 
 
 def make_points(path: Path) -> None:
@@ -83,6 +112,8 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     make_raster(args.out_dir / "tiny.tif")
+    make_dem(args.out_dir / "tiny_before.tif", DEM_BEFORE_ELEVATION)
+    make_dem(args.out_dir / "tiny_after.tif", DEM_AFTER_ELEVATION)
     make_points(args.out_dir / "tiny.las")
     print(f"fixtures written to {args.out_dir}")
 
