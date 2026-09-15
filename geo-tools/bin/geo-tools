@@ -9,22 +9,36 @@ a shell), so an argument can never inject a second command. This validation
 mirrors the server-side validation in the dispatching layer — defense in depth.
 
 Recipes:
-  tiff-to-cog     raster  -> Cloud-Optimized GeoTIFF
-  reproject       raster  -> reprojected raster
-  hillshade       DEM     -> hillshade raster
-  laz-to-copc     LAS/LAZ -> Cloud-Optimized Point Cloud (.copc.laz)
-  reproject-laz   LAS/LAZ -> reprojected LAS/LAZ
-  laz-to-dem      LAS/LAZ -> DTM + DSM GeoTIFFs (SMRF ground classification)
+  tiff-to-cog        raster  -> Cloud-Optimized GeoTIFF
+  reproject          raster  -> reprojected raster
+  hillshade          DEM     -> hillshade raster
+  laz-to-copc        LAS/LAZ -> Cloud-Optimized Point Cloud (.copc.laz)
+  reproject-laz      LAS/LAZ -> reprojected LAS/LAZ
+  laz-to-dem         LAS/LAZ -> DTM + DSM GeoTIFFs (SMRF ground classification)
+  dem-of-difference  DEM x2  -> elevation-change raster + change statistics
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+import math
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+# The dem-of-difference recipe subtracts two rasters cell by cell, which no
+# gdal CLI does on its own, so it reaches for the GDAL Python bindings and
+# numpy. Both ship in the image's pinned conda env (conda-forge's gdal python
+# package depends on numpy), and importing them here makes a broken env fail
+# loudly at `geo-tools --help` rather than midway through a long job.
+import numpy as np
+from osgeo import gdal, osr
+
+gdal.UseExceptions()
 
 # A CRS token flows onto a command line, so restrict it to an authority:code
 # form (e.g. EPSG:32615) with no shell-significant characters. Free proj4/WKT
@@ -32,6 +46,15 @@ from pathlib import Path
 CRS_RE = re.compile(r"^[A-Za-z]{3,10}:\d{2,7}$")
 COG_COMPRESSIONS = {"DEFLATE", "ZSTD", "LZW", "NONE"}
 RESAMPLINGS = {"nearest", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode"}
+
+# dem-of-difference output conventions. -9999 is the long-standing DEM nodata
+# sentinel and sits far outside any real elevation change. 100 histogram bins
+# is a presentation choice: enough shape to read a change distribution by eye,
+# few enough that the CSV stays legible. 512-row stripes keep a 10k-wide
+# float32 pair of blocks in the tens of megabytes rather than gigabytes.
+DOD_NODATA = -9999.0
+HIST_BINS = 100
+BLOCK_ROWS = 512
 
 
 def _ensure_toolchain_on_path() -> None:
@@ -213,6 +236,343 @@ def recipe_laz_to_dem(a: argparse.Namespace) -> int:
     )
 
 
+def _open_raster(path: str, role: str) -> gdal.Dataset:
+    """Open a raster read-only, failing with a caller-facing message."""
+    try:
+        dataset = gdal.Open(path, gdal.GA_ReadOnly)
+    except RuntimeError as exc:
+        _fail(f"{role} raster {path} could not be opened: {exc}")
+    if dataset is None:
+        _fail(f"{role} raster {path} could not be opened")
+    return dataset
+
+
+def _raster_srs(dataset: gdal.Dataset, role: str, path: str) -> osr.SpatialReference:
+    """Return the dataset's SRS, failing if it carries none or cannot be parsed."""
+    wkt = dataset.GetProjection()
+    if not wkt:
+        _fail(f"{role} raster {path} carries no CRS; both surfaces must be georeferenced")
+    srs = osr.SpatialReference()
+    if srs.ImportFromWkt(wkt) != 0:
+        _fail(f"{role} raster {path} has a CRS that could not be parsed")
+    return srs
+
+
+def _require_projected_meters(srs: osr.SpatialReference, path: str) -> None:
+    """Refuse an AFTER grid that is not projected with a linear unit of one meter.
+
+    Areas and volumes in the difference statistics are cell counts multiplied by
+    cell size, so the grid's own units must be meters. A geographic CRS has
+    degree-sized cells whose ground area varies with latitude, which would make
+    ``area_changed_m2`` and both volume sums meaningless rather than merely
+    imprecise — so it is refused up front instead of silently mis-scaled.
+    """
+    if not srs.IsProjected() or abs(srs.GetLinearUnits() - 1.0) > 1e-6:
+        _fail(
+            f"--after raster {path} is not a projected CRS in meters; reproject both "
+            "surfaces to a projected metric CRS first, e.g. "
+            "geo-tools reproject --input in.tif --output out.tif --target-crs EPSG:32615"
+        )
+
+
+def _grid_geometry(dataset: gdal.Dataset, path: str) -> tuple[list[float], float, float]:
+    """Return ([xmin, ymin, xmax, ymax], cell_size_x, cell_size_y) for a north-up grid.
+
+    Rotated (non-north-up) geotransforms are refused: the alignment step below
+    describes the target grid to gdalwarp as ``-te`` plus ``-tr``, which can only
+    express an axis-aligned grid, so a rotated AFTER raster would be silently
+    resampled onto a different grid than the one it claims to define.
+    """
+    gt = dataset.GetGeoTransform()
+    if gt[2] != 0.0 or gt[4] != 0.0:
+        _fail(
+            f"--after raster {path} has a rotated geotransform; only north-up grids are supported"
+        )
+    cell_x = abs(gt[1])
+    cell_y = abs(gt[5])
+    if cell_x == 0.0 or cell_y == 0.0:
+        _fail(f"--after raster {path} has a degenerate cell size")
+    xs = (gt[0], gt[0] + dataset.RasterXSize * gt[1])
+    ys = (gt[3], gt[3] + dataset.RasterYSize * gt[5])
+    return [min(xs), min(ys), max(xs), max(ys)], cell_x, cell_y
+
+
+def _target_srs_arg(srs: osr.SpatialReference, out_dir: Path) -> tuple[str, str]:
+    """Return (gdalwarp -t_srs value, crs label for the stats JSON).
+
+    An ``AUTHORITY:CODE`` token is a short, shell-safe argv value, so it is used
+    whenever the AFTER SRS carries one. A custom projection has no such token and
+    its WKT is long and full of quotes and brackets — so the WKT is written to a
+    file inside the output directory and the *path* is passed instead. gdalwarp
+    accepts a filename containing WKT for ``-t_srs``; nothing unbounded reaches
+    argv either way.
+    """
+    authority = srs.GetAuthorityName(None)
+    code = srs.GetAuthorityCode(None)
+    if authority and code:
+        return f"{authority}:{code}", f"{authority}:{code}"
+    wkt_path = out_dir / "after_crs.wkt"
+    wkt_path.write_text(srs.ExportToWkt(), encoding="utf-8")
+    return str(wkt_path), "custom"
+
+
+def _valid_mask(block: np.ndarray, nodata: float | None) -> np.ndarray:
+    mask = np.isfinite(block)
+    if nodata is not None:
+        mask &= block != np.float32(nodata)
+    return mask
+
+
+def _difference_pass(
+    after_ds: gdal.Dataset,
+    aligned_ds: gdal.Dataset,
+    out_path: Path,
+    threshold: float,
+    cell_area: float,
+) -> dict[str, float]:
+    """Write AFTER - before_aligned to ``out_path`` and accumulate its statistics.
+
+    Read in row stripes rather than whole bands: a 10k x 10k float32 pair is
+    ~800 MB if both are held at once, whereas one BLOCK_ROWS stripe of each is a
+    few tens of MB. Mean and standard deviation come from running sum and
+    sum-of-squares over valid cells only (population standard deviation), which
+    keeps the pass single and needs no second read; no median is computed, since
+    that would require the full array in memory.
+    """
+    xsize, ysize = after_ds.RasterXSize, after_ds.RasterYSize
+    if (aligned_ds.RasterXSize, aligned_ds.RasterYSize) != (xsize, ysize):
+        _fail(
+            "aligned --before grid does not match the --after grid; alignment step "
+            f"produced {aligned_ds.RasterXSize}x{aligned_ds.RasterYSize}, "
+            f"expected {xsize}x{ysize}"
+        )
+
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        str(out_path),
+        xsize,
+        ysize,
+        1,
+        gdal.GDT_Float32,
+        options=["TILED=YES", "COMPRESS=DEFLATE", "NUM_THREADS=ALL_CPUS", "BIGTIFF=IF_SAFER"],
+    )
+    out_ds.SetGeoTransform(after_ds.GetGeoTransform())
+    out_ds.SetProjection(after_ds.GetProjection())
+    out_band = out_ds.GetRasterBand(1)
+    out_band.SetNoDataValue(DOD_NODATA)
+
+    after_band = after_ds.GetRasterBand(1)
+    before_band = aligned_ds.GetRasterBand(1)
+    after_nodata = after_band.GetNoDataValue()
+    before_nodata = before_band.GetNoDataValue()
+
+    n_valid = 0
+    n_changed = 0
+    total = 0.0
+    total_sq = 0.0
+    dz_min = math.inf
+    dz_max = -math.inf
+    gain = 0.0
+    loss = 0.0
+
+    for row in range(0, ysize, BLOCK_ROWS):
+        rows = min(BLOCK_ROWS, ysize - row)
+        after = after_band.ReadAsArray(0, row, xsize, rows).astype(np.float32, copy=False)
+        before = before_band.ReadAsArray(0, row, xsize, rows).astype(np.float32, copy=False)
+        valid = _valid_mask(after, after_nodata) & _valid_mask(before, before_nodata)
+
+        stripe = np.full((rows, xsize), DOD_NODATA, dtype=np.float32)
+        np.subtract(after, before, out=stripe, where=valid)
+        out_band.WriteArray(stripe, 0, row)
+
+        dz = stripe[valid].astype(np.float64, copy=False)
+        if dz.size:
+            n_valid += int(dz.size)
+            total += float(dz.sum())
+            total_sq += float(np.square(dz).sum())
+            dz_min = min(dz_min, float(dz.min()))
+            dz_max = max(dz_max, float(dz.max()))
+            gain += float(dz[dz > threshold].sum())
+            loss += float(-dz[dz < -threshold].sum())
+            n_changed += int(np.count_nonzero(np.abs(dz) > threshold))
+
+    # The band holds a reference to its dataset, so dropping only ``out_ds``
+    # would leave the GeoTIFF open — and the histogram pass below reopens this
+    # same file. Release the band first so the close, and the header write that
+    # goes with it, actually happen here.
+    out_band.FlushCache()
+    out_ds.FlushCache()
+    out_band = None
+    out_ds = None
+
+    if n_valid == 0:
+        _fail("no cells are valid in both surfaces; check that they overlap and share a site")
+
+    mean = total / n_valid
+    # Population variance from the running sums; clamped at zero because
+    # catastrophic cancellation can drive a numerically-zero variance slightly
+    # negative when every dz is identical.
+    variance = max(total_sq / n_valid - mean * mean, 0.0)
+    return {
+        "n_valid_cells": n_valid,
+        "n_changed_cells": n_changed,
+        "area_changed_m2": n_changed * cell_area,
+        "dz_mean": mean,
+        "dz_std": math.sqrt(variance),
+        "dz_min": dz_min,
+        "dz_max": dz_max,
+        "volume_gain_m3": gain * cell_area,
+        "volume_loss_m3": loss * cell_area,
+        "net_volume_m3": (gain - loss) * cell_area,
+    }
+
+
+def _histogram_pass(dod_path: Path, dz_min: float, dz_max: float, csv_path: Path) -> None:
+    """Write a HIST_BINS-bin histogram of the difference surface to ``csv_path``.
+
+    A second read of the just-written difference raster, again in row stripes, so
+    the histogram costs no extra memory over the first pass. The bin edges span
+    the observed [dz_min, dz_max] measured in that first pass.
+    """
+    lo, hi = dz_min, dz_max
+    if not hi > lo:
+        # A perfectly uniform difference surface has zero spread. Widen by the
+        # same +/-0.5 numpy.histogram applies to a degenerate range, so the CSV
+        # still carries HIST_BINS rows with the count in the middle one.
+        lo, hi = lo - 0.5, hi + 0.5
+    edges = np.linspace(lo, hi, HIST_BINS + 1)
+    counts = np.zeros(HIST_BINS, dtype=np.int64)
+
+    dataset = _open_raster(str(dod_path), "difference")
+    band = dataset.GetRasterBand(1)
+    xsize, ysize = dataset.RasterXSize, dataset.RasterYSize
+    for row in range(0, ysize, BLOCK_ROWS):
+        rows = min(BLOCK_ROWS, ysize - row)
+        block = band.ReadAsArray(0, row, xsize, rows)
+        dz = block[block != np.float32(DOD_NODATA)]
+        if dz.size:
+            counts += np.histogram(dz, bins=edges)[0]
+    dataset = None
+
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["bin_lower", "bin_upper", "count"])
+        for index in range(HIST_BINS):
+            writer.writerow([f"{edges[index]:.6f}", f"{edges[index + 1]:.6f}", int(counts[index])])
+
+
+def recipe_dem_of_difference(a: argparse.Namespace) -> int:
+    """Difference two elevation surfaces of the same site, onto the later grid.
+
+    A DEM of difference (DoD) is the standard way to measure topographic change
+    between two survey dates — a 2024 minus a 2022 DTM of the same park, or a
+    river reach before and after a flood. The AFTER surface defines the output
+    grid (CRS, extent, cell size) because it is the later, usually better survey;
+    BEFORE is warped onto that grid so the two are cell-for-cell comparable.
+
+    Three artifacts land in ``--output-dir``: ``dod.tif`` (the Cloud-Optimized
+    GeoTIFF of AFTER minus BEFORE, nodata -9999), ``dod_stats.json`` (cell
+    counts, elevation-change moments and eroded/deposited volumes), and
+    ``dod_hist.csv`` (the distribution of elevation change). The aligned BEFORE
+    surface is kept as ``before_aligned.tif`` so the subtraction can be audited.
+
+    Cells changed by no more than ``--threshold`` meters are excluded from the
+    changed-cell count and from both volumes. That threshold is the survey's own
+    level of detection: in DoD practice, change smaller than the combined
+    vertical uncertainty of the two surfaces is not distinguishable from noise
+    (Wheaton et al. 2010, Earth Surf. Process. Landforms 35, 136-156). The
+    default of 0 counts every changed cell and leaves the choice to the caller.
+    """
+    if a.resampling not in RESAMPLINGS:
+        _fail(f"resampling must be one of {sorted(RESAMPLINGS)}")
+    threshold = _bounded_float(a.threshold, "threshold", 0.0, 100.0)
+    after_path = _existing_input(a.after)
+    before_path = _existing_input(a.before)
+
+    after_ds = _open_raster(after_path, "--after")
+    before_ds = _open_raster(before_path, "--before")
+    after_srs = _raster_srs(after_ds, "--after", after_path)
+    _raster_srs(before_ds, "--before", before_path)
+    _require_projected_meters(after_srs, after_path)
+    before_ds = None
+
+    bounds, cell_x, cell_y = _grid_geometry(after_ds, after_path)
+    cell_area = cell_x * cell_y
+    out_dir = Path(a.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t_srs, crs_label = _target_srs_arg(after_srs, out_dir)
+
+    aligned_path = out_dir / "before_aligned.tif"
+    rc = _run(
+        [
+            "gdalwarp",
+            "-te",
+            *(f"{value:.10f}" for value in bounds),
+            "-tr",
+            f"{cell_x:.10f}",
+            f"{cell_y:.10f}",
+            "-t_srs",
+            t_srs,
+            "-r",
+            a.resampling,
+            "-dstnodata",
+            "-9999",
+            "-ot",
+            "Float32",
+            "-overwrite",
+            before_path,
+            str(aligned_path),
+        ]
+    )
+    if rc != 0:
+        return rc
+
+    aligned_ds = _open_raster(str(aligned_path), "aligned --before")
+    intermediate = out_dir / "dod_uncompressed.tif"
+    stats = _difference_pass(after_ds, aligned_ds, intermediate, threshold, cell_area)
+    aligned_ds = None
+    after_ds = None
+
+    _histogram_pass(intermediate, stats["dz_min"], stats["dz_max"], out_dir / "dod_hist.csv")
+
+    rc = _run(
+        [
+            "gdal_translate",
+            "-of",
+            "COG",
+            "-co",
+            "COMPRESS=DEFLATE",
+            "-co",
+            "OVERVIEWS=AUTO",
+            "-co",
+            "NUM_THREADS=ALL_CPUS",
+            "-co",
+            "BIGTIFF=IF_SAFER",
+            str(intermediate),
+            str(out_dir / "dod.tif"),
+        ]
+    )
+    if rc != 0:
+        return rc
+    intermediate.unlink()
+
+    stats_doc = {
+        "after": Path(after_path).name,
+        "before": Path(before_path).name,
+        "crs": crs_label,
+        "cell_size_x": cell_x,
+        "cell_size_y": cell_y,
+        "cell_area_m2": cell_area,
+        "threshold_m": threshold,
+        "resampling": a.resampling,
+        **stats,
+    }
+    stats_path = out_dir / "dod_stats.json"
+    stats_path.write_text(json.dumps(stats_doc, indent=2) + "\n", encoding="utf-8")
+    print(f"geo-tools: wrote {out_dir / 'dod.tif'}, dod_stats.json, dod_hist.csv", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="geo-tools", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="recipe", required=True)
@@ -260,6 +620,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolution", default="1.0", help="output grid resolution in CRS units (default 1.0)"
     )
     p.set_defaults(func=recipe_laz_to_dem)
+
+    p = sub.add_parser(
+        "dem-of-difference", help="two DEMs -> elevation-change raster + change statistics"
+    )
+    p.add_argument(
+        "--after", required=True, help="later elevation surface; defines the output grid"
+    )
+    p.add_argument(
+        "--before", required=True, help="earlier elevation surface; warped onto that grid"
+    )
+    p.add_argument(
+        "--output-dir",
+        required=True,
+        dest="output_dir",
+        help="directory for dod.tif + dod_stats.json + dod_hist.csv outputs",
+    )
+    p.add_argument(
+        "--threshold",
+        default="0",
+        help="level of detection in meters; |dz| at or below this is not change (default 0)",
+    )
+    p.add_argument("--resampling", default="bilinear", help="resampling method (default bilinear)")
+    p.set_defaults(func=recipe_dem_of_difference)
 
     return parser
 
