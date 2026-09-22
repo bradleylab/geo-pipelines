@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Ground, surface and canopy height from one lidar file.
+
+Implements entrypoint contract v1 (fossettlab/geospatial-executor,
+docs/contracts/entrypoint-v1.md): exactly three options, the point cloud staged
+under ``<input-dir>/primary/``, and every artifact plus ``run.json`` written
+under ``<output-dir>``. The design is
+``docs/atlas_ground_surfaces_spec_2026-09-22.md`` in fossettlab/atlas-agent.
+
+Three rasters share one grid: a DTM (ground returns, inverse-distance
+weighting), a DSM (the highest non-noise return in each cell) and a CHM
+(DSM minus DTM). Noise never reaches a surface. The ground comes either from
+SMRF (Pingel et al. 2013) run afresh or from the file's own class 2 returns.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pdal
+from osgeo import gdal, osr
+
+gdal.UseExceptions()
+
+CONTRACT_VERSION = 1
+
+# ASPRS LAS 1.4 classification codes.
+NEVER_CLASSIFIED, UNCLASSIFIED, GROUND = 0, 1, 2
+NOISE_CLASSES = (7, 18)  # low point (noise), high noise
+
+# The same bounds as laz_to_dem's registry entry, so the two tasks accept the
+# same grids.
+RESOLUTION_MIN, RESOLUTION_MAX, RESOLUTION_DEFAULT = 0.05, 50.0, 1.0
+GROUND_SOURCES = ("classify", "existing")
+# PDAL 2.8.1's own SMRF defaults, so the report can name every value a run
+# used (filters/SMRFilter.cpp at tag 2.8.1: slope, scalar, threshold and cell
+# at lines 108-111; window, when unset, is 18 * cell at lines 161-162). The
+# image build fails if the pinned PDAL reports other values for the four it
+# lists (Dockerfile).
+SMRF_CELL = 1.0
+SMRF_DEFAULTS = {"slope": 0.15, "window": 18 * SMRF_CELL, "threshold": 0.5, "scalar": 1.25}
+SMRF_RETURNS = "last, only"
+# Sent to filters.smrf under PDAL's own option names.
+SMRF_OPTIONS = {
+    "smrf_slope": "slope",
+    "smrf_window": "window",
+    "smrf_threshold": "threshold",
+    "smrf_scalar": "scalar",
+}
+# Window is a size, so zero is meaningless; the others may be zero.
+SMRF_STRICTLY_POSITIVE = {"smrf_window"}
+KNOWN_PARAMS = {"resolution", "ground_source", *SMRF_OPTIONS}
+
+# Output conventions shared with geo-tools' dem-of-difference: -9999 is the
+# long-standing DEM nodata sentinel, and the COG options are the same.
+NODATA = -9999.0
+COG_OPTIONS = ["COMPRESS=DEFLATE", "OVERVIEWS=AUTO", "NUM_THREADS=ALL_CPUS", "BIGTIFF=IF_SAFER"]
+STRIPE_ROWS = 512  # keeps a very fine grid's CHM pass to tens of megabytes
+
+OUTPUTS = (
+    ("dtm.tif", "dtm"),
+    ("dsm.tif", "dsm"),
+    ("chm.tif", "chm"),
+    ("surfaces_report.json", "report"),
+)
+
+
+class Refused(Exception):
+    """Input or parameters this recipe will not run on; the message is for the caller."""
+
+
+@dataclass(frozen=True)
+class Params:
+    resolution: float
+    ground_source: str
+    smrf: dict[str, float]  # PDAL option name -> value, only those supplied
+
+
+@dataclass(frozen=True)
+class Grid:
+    origin_x: float
+    origin_y: float
+    width: int
+    height: int
+    resolution: float
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="ground-surfaces", allow_abbrev=False)
+    parser.add_argument("--input-dir", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--params-json", required=True, type=Path)
+    return parser.parse_args(argv)
+
+
+def _number(raw: Any, name: str) -> float:
+    # Contract v1 delivers every validated value as a string.
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise Refused(f"{name} must be a number, got {raw!r}") from None
+    if not math.isfinite(value):
+        raise Refused(f"{name} must be finite, got {raw!r}")
+    return value
+
+
+def read_params(path: Path) -> Params:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise Refused("params.json must hold a JSON object")
+    unknown = sorted(set(raw) - KNOWN_PARAMS)
+    if unknown:
+        raise Refused(f"unknown parameters {unknown}; this task takes {sorted(KNOWN_PARAMS)}")
+
+    resolution = _number(raw.get("resolution", RESOLUTION_DEFAULT), "resolution")
+    if not RESOLUTION_MIN <= resolution <= RESOLUTION_MAX:
+        raise Refused(f"resolution must be {RESOLUTION_MIN}-{RESOLUTION_MAX}, got {resolution}")
+
+    ground_source = str(raw.get("ground_source", GROUND_SOURCES[0]))
+    if ground_source not in GROUND_SOURCES:
+        raise Refused(f"ground_source must be one of {list(GROUND_SOURCES)}, got {ground_source!r}")
+
+    smrf: dict[str, float] = {}
+    for name, option in SMRF_OPTIONS.items():
+        if name not in raw:
+            continue
+        value = _number(raw[name], name)
+        if value < 0 or (name in SMRF_STRICTLY_POSITIVE and value == 0):
+            raise Refused(
+                f"{name} must be {'above' if name in SMRF_STRICTLY_POSITIVE else 'at least'} 0"
+            )
+        smrf[option] = value
+    return Params(resolution, ground_source, smrf)
+
+
+def find_point_cloud(input_dir: Path) -> Path:
+    primary = input_dir / "primary"
+    files = [p for p in primary.rglob("*") if p.is_file()] if primary.is_dir() else []
+    clouds = [p for p in files if p.suffix.lower() in {".las", ".laz"}]
+    if len(clouds) != 1:
+        raise Refused(
+            f"expected exactly one .las or .laz file under {primary}, found {len(clouds)}"
+        )
+    return clouds[0]
+
+
+def read_points(path: Path) -> tuple[np.ndarray, str]:
+    pipeline = pdal.Reader.las(filename=str(path)).pipeline()
+    pipeline.execute()
+    return pipeline.arrays[0], pipeline.srswkt2
+
+
+def check_crs(wkt: str) -> osr.SpatialReference:
+    if not wkt:
+        raise Refused("the point cloud has no CRS; assign one before gridding it")
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(wkt)
+    if srs.IsGeographic() or not srs.IsProjected() or srs.GetLinearUnits() != 1.0:
+        raise Refused(
+            "the point cloud's CRS is not a projected CRS in meters, so cell sizes and "
+            "heights would be meaningless; reproject it first with reproject_laz"
+        )
+    return srs
+
+
+def mark_noise(points: np.ndarray) -> tuple[np.ndarray, str]:
+    """Return the noise mask, and whether it came from the file or the outlier filter.
+
+    A classified file already says which returns are noise. A file whose
+    returns are all class 0 or 1 says nothing, so PDAL's statistical outlier
+    filter marks them (as class 7) at PDAL's defaults.
+    """
+    classes = points["Classification"]
+    if np.isin(classes, (NEVER_CLASSIFIED, UNCLASSIFIED)).all():
+        filtered = pdal.Filter.outlier(method="statistical").pipeline(points)
+        filtered.execute()
+        marked = filtered.arrays[0]
+        return np.isin(marked["Classification"], NOISE_CLASSES), "outlier_filter"
+    return np.isin(classes, NOISE_CLASSES), "classified"
+
+
+def find_ground(points: np.ndarray, params: Params) -> np.ndarray:
+    """Return the ground returns of an array that holds no noise."""
+    if params.ground_source == "existing":
+        ground = points[points["Classification"] == GROUND]
+        if ground.size == 0:
+            raise Refused("the file has no class 2 (ground) returns; use ground_source=classify")
+        return ground
+    # Reset first, so SMRF's answer does not depend on what the file carried.
+    reset = points.copy()
+    reset["Classification"] = UNCLASSIFIED
+    smrf = pdal.Filter.smrf(**params.smrf).pipeline(reset)
+    smrf.execute()
+    classified = smrf.arrays[0]
+    ground = classified[classified["Classification"] == GROUND]
+    if ground.size == 0:
+        raise Refused("SMRF found no ground returns; check the SMRF parameters")
+    return ground
+
+
+def shared_grid(points: np.ndarray, resolution: float) -> Grid:
+    """One grid covering every non-noise return, its edges on multiples of resolution."""
+    origin_x = math.floor(points["X"].min() / resolution) * resolution
+    origin_y = math.floor(points["Y"].min() / resolution) * resolution
+    # +1 keeps a return lying exactly on the far edge inside the last cell.
+    width = int((points["X"].max() - origin_x) // resolution) + 1
+    height = int((points["Y"].max() - origin_y) // resolution) + 1
+    return Grid(origin_x, origin_y, width, height, resolution)
+
+
+def write_surface(
+    points: np.ndarray, grid: Grid, wkt: str, path: Path, *, output_type: str, binned: bool
+) -> None:
+    writer = pdal.Writer.gdal(
+        filename=str(path),
+        resolution=grid.resolution,
+        origin_x=grid.origin_x,
+        origin_y=grid.origin_y,
+        width=grid.width,
+        height=grid.height,
+        output_type=output_type,
+        binmode=binned,
+        data_type="float",
+        nodata=NODATA,
+        override_srs=wkt,
+    )
+    writer.pipeline(points).execute()
+
+
+def to_cog(source: Path, target: Path) -> None:
+    gdal.Translate(str(target), str(source), format="COG", creationOptions=COG_OPTIONS)
+
+
+def nodata_count(path: Path) -> int:
+    dataset = gdal.Open(str(path))  # held: a band outlives nothing it belongs to
+    values = dataset.GetRasterBand(1).ReadAsArray()
+    return int((values == np.float32(NODATA)).sum())
+
+
+def write_chm(dtm_path: Path, dsm_path: Path, target: Path) -> dict[str, Any]:
+    """DSM minus DTM, stripe by stripe; negative cells are kept and counted."""
+    dtm = gdal.Open(str(dtm_path))
+    dsm = gdal.Open(str(dsm_path))
+    xsize, ysize = dtm.RasterXSize, dtm.RasterYSize
+    if (dsm.RasterXSize, dsm.RasterYSize) != (xsize, ysize) or (
+        dsm.GetGeoTransform() != dtm.GetGeoTransform()
+    ):
+        raise RuntimeError("the DTM and DSM grids differ; the CHM would be misregistered")
+    staging = target.with_suffix(".uncompressed.tif")
+    out = gdal.GetDriverByName("GTiff").Create(
+        str(staging), xsize, ysize, 1, gdal.GDT_Float32, options=["TILED=YES", "BIGTIFF=IF_SAFER"]
+    )
+    out.SetGeoTransform(dtm.GetGeoTransform())
+    out.SetProjection(dtm.GetProjection())
+    band = out.GetRasterBand(1)
+    band.SetNoDataValue(NODATA)
+
+    count, total, low, high, negative = 0, 0.0, math.inf, -math.inf, 0
+    for row in range(0, ysize, STRIPE_ROWS):
+        rows = min(STRIPE_ROWS, ysize - row)
+        ground = dtm.GetRasterBand(1).ReadAsArray(0, row, xsize, rows)
+        surface = dsm.GetRasterBand(1).ReadAsArray(0, row, xsize, rows)
+        valid = (ground != np.float32(NODATA)) & (surface != np.float32(NODATA))
+        height = np.where(valid, surface - ground, np.float32(NODATA)).astype(np.float32)
+        band.WriteArray(height, 0, row)
+        values = height[valid]
+        if values.size:
+            count += int(values.size)
+            total += float(values.sum(dtype=np.float64))
+            low, high = min(low, float(values.min())), max(high, float(values.max()))
+            negative += int((values < 0).sum())
+    band.FlushCache()
+    out = None
+    to_cog(staging, target)
+    staging.unlink()
+    return {
+        "valid_cells": count,
+        "min_m": low if count else None,
+        "mean_m": total / count if count else None,
+        "max_m": high if count else None,
+        "negative_cells": negative,
+    }
+
+
+def class_counts(points: np.ndarray) -> dict[str, int]:
+    values, counts = np.unique(points["Classification"], return_counts=True)
+    return {str(int(v)): int(c) for v, c in zip(values, counts, strict=True)}
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run(input_dir: Path, output_dir: Path, params: Params) -> None:
+    source = find_point_cloud(input_dir)
+    points, wkt = read_points(source)
+    srs = check_crs(wkt)
+    if points.size == 0:
+        raise Refused(f"{source.name} holds no returns")
+
+    noise, noise_source = mark_noise(points)
+    kept = points[~noise]
+    if kept.size == 0:
+        raise Refused("every return in the file is noise")
+    ground = find_ground(kept, params)
+    grid = shared_grid(kept, params.resolution)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output_dir) as scratch:
+        work = Path(scratch)
+        write_surface(ground, grid, wkt, work / "dtm.tif", output_type="idw", binned=False)
+        write_surface(kept, grid, wkt, work / "dsm.tif", output_type="max", binned=True)
+        to_cog(work / "dtm.tif", output_dir / "dtm.tif")
+        to_cog(work / "dsm.tif", output_dir / "dsm.tif")
+    chm = write_chm(output_dir / "dtm.tif", output_dir / "dsm.tif", output_dir / "chm.tif")
+
+    report = {
+        "input": source.name,
+        "returns_read": int(points.size),
+        "returns_by_class": class_counts(points),
+        "noise_left_out": int(noise.sum()),
+        "noise_source": noise_source,
+        "returns_in_dsm": int(kept.size),
+        "returns_in_dtm": int(ground.size),
+        "ground_source": params.ground_source,
+        "smrf": (
+            SMRF_DEFAULTS
+            | params.smrf
+            | {"cell": SMRF_CELL, "returns": SMRF_RETURNS, "supplied": sorted(params.smrf)}
+            if params.ground_source == "classify"
+            else "not used"
+        ),
+        "grid": {
+            "crs": srs.GetName(),
+            "cell_size_m": grid.resolution,
+            "width": grid.width,
+            "height": grid.height,
+            "origin_x": grid.origin_x,
+            "origin_y": grid.origin_y,
+        },
+        "nodata_cells": {
+            "dtm": nodata_count(output_dir / "dtm.tif"),
+            "dsm": nodata_count(output_dir / "dsm.tif"),
+            "chm": nodata_count(output_dir / "chm.tif"),
+        },
+        "chm": chm,
+        "versions": {"pdal": pdal.info.version, "gdal": gdal.__version__},
+    }
+    (output_dir / "surfaces_report.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    # The manifest goes last: its presence is what says the run finished.
+    manifest = {
+        "contract_version": CONTRACT_VERSION,
+        "outputs": [
+            {"path": name, "role": role, "sha256": sha256(output_dir / name)}
+            | ({"format": "GTiff"} if name.endswith(".tif") else {})
+            for name, role in OUTPUTS
+        ],
+    }
+    if chm["negative_cells"]:
+        manifest["warnings"] = [
+            (
+                f"{chm['negative_cells']} CHM cells are negative, where the interpolated DTM "
+                f"lies above the DSM; they are kept as computed"
+            )
+        ]
+    (output_dir / "run.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        params = read_params(args.params_json)
+        run(args.input_dir, args.output_dir, params)
+    except Refused as exc:
+        print(f"ground-surfaces: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

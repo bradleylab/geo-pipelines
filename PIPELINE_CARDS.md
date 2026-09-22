@@ -145,6 +145,42 @@ recipe accepts a free-form gdal/pdal string; commands run as an argv list.
 
 ---
 
+## ground-surfaces
+
+**Purpose.** From one lidar point cloud, a bare-ground DTM, a top-surface DSM
+and a canopy height model (CHM = DSM − DTM) on one grid, with a report of how
+the ground was found. Built to entrypoint contract v1, so it carries one task.
+
+**Inputs.** One `.las` or `.laz` file in a projected CRS in meters, staged
+under `<input-dir>/primary/`; parameters in `params.json`: `resolution`,
+`ground_source` (`classify` or `existing`) and four SMRF parameters, all
+validated.
+
+**Products.**
+- `dtm.tif` → ground returns, IDW grid
+- `dsm.tif` → highest non-noise return in each cell
+- `chm.tif` → DSM − DTM; negative cells kept and counted
+- `surfaces_report.json` → returns by class, noise left out, SMRF values used,
+  grid, nodata counts, CHM statistics, PDAL and GDAL versions
+- `run.json` → the contract manifest
+
+**Run.** `ground-surfaces --input-dir <dir> --output-dir <dir> --params-json
+<file>`, the only three options the entrypoint takes.
+
+**Stack.**
+- Base: `mambaorg/micromamba:1.5.10`
+- GDAL 3.9 + PDAL 2.8 from conda-forge, as `geo-tools`
+
+**Known boundaries.**
+- Noise is ASPRS classes 7 and 18 in a classified file; in an unclassified
+  file it is whatever PDAL's statistical outlier filter marks at its defaults.
+- The DTM is not gap-filled, and the classified point cloud is not returned.
+- One file per run; tiled surveys are not mosaicked.
+
+**Lab status.** Active (v1 in progress). Atlas's second course pipeline.
+
+---
+
 ## snap-insar
 
 **Purpose.** Sentinel-1 InSAR via ESA SNAP 12 + the Sentinel-1 Toolbox:

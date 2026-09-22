@@ -64,6 +64,7 @@ it belongs in an analysis repo as a uv/conda env.
 |------------|-----------|--------|----------|--------|
 | `splat-pipeline` | [`splat-pipeline/`](splat-pipeline/) | iPhone/drone video or image dir | 3DGS `.ply` + COLMAP sparse | active (v1 in progress) |
 | `geo-tools` | [`geo-tools/`](geo-tools/) | raster `.tif` or point cloud `.las`/`.laz` | COG / COPC / reprojected / hillshade | active (v1) |
+| `ground-surfaces` | [`ground-surfaces/`](ground-surfaces/) | point cloud `.las`/`.laz` | DTM + DSM + canopy height on one grid, report | active (v1 in progress) |
 | `ortho-pipeline` | [`ortho-pipeline/`](ortho-pipeline/) | drone image dir (+ optional GCPs) | ortho `.tif` + DSM/DTM + point cloud | active (v1 in progress) |
 
 ## Using a pipeline
