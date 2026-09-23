@@ -90,7 +90,9 @@ jobs:
 
       - name: Contract entrypoint
         # The image's own ENTRYPOINT, given only the three options, as a
-        # compute provider runs it.
+        # compute provider runs it, and with a host's PATH rather than the
+        # image's: a job step on Compute2 carries the host's, so the entrypoint
+        # must not need /opt/conda/bin on PATH to start.
         run: |
           IMAGE="$(cut -d, -f1 <<<"${{ steps.tags.outputs.tags }}")"
           WORK="${{ runner.temp }}/contract"
@@ -100,7 +102,9 @@ jobs:
             -v "${WORK}:/work" \
             --entrypoint python \
             "${IMAGE}" /tests/smoke.py --fixtures-only /work
-          docker run --rm -v "${WORK}:/work" "${IMAGE}" \
+          docker run --rm -v "${WORK}:/work" \
+            -e PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            "${IMAGE}" \
             --input-dir /work/cases/classify/input \
             --output-dir /work/out \
             --params-json /work/cases/classify/params.json

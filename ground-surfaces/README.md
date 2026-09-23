@@ -82,7 +82,7 @@ manifest.
 
 ```bash
 # input/primary/cloud.laz, and params.json such as {"resolution": "1.0"}
-docker run --rm -v "$PWD:/work" ghcr.io/bradleylab/ground-surfaces:v1 \
+docker run --rm -v "$PWD:/work" ghcr.io/bradleylab/ground-surfaces:v2 \
   --input-dir /work/input \
   --output-dir /work/output \
   --params-json /work/params.json
@@ -90,16 +90,18 @@ docker run --rm -v "$PWD:/work" ghcr.io/bradleylab/ground-surfaces:v1 \
 
 ## How it is used
 
-On Compute2 the image is imported once to a `.sqsh` cache and run by `srun`
-with pyxis's `--container-entrypoint`, which hands the three options to the
-image's entrypoint. The environment is on `PATH` in the image, so no shell
-activation is needed.
+On Compute2 the image is imported once to a `.sqsh` cache and run by `srun`,
+which names the image's entrypoint program, read from its configuration, and
+then the three options. pyxis does not hand arguments to an entrypoint through
+`--container-entrypoint`, so the step names the program itself. A job step
+carries the host's `PATH`, not the image's, so the entrypoint and its
+interpreter line are absolute paths.
 
 ```bash
 # One-time per version: import the GHCR image to a .sqsh cache
 ssh pliny 'ssh c2 "enroot import \
-  -o /storage3/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+ground-surfaces+v1.sqsh \
-  'docker://ghcr.io#bradleylab/ground-surfaces:v1'"'
+  -o /storage3/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+ground-surfaces+v2.sqsh \
+  'docker://ghcr.io#bradleylab/ground-surfaces:v2'"'
 ```
 
 ## Tests
@@ -113,7 +115,8 @@ one grid, that the manifest's checksums match, and that the report names the
 SMRF values used. It runs the unclassified, classified, supplied-parameter and
 existing-ground cases, and checks three refusals: a geographic CRS, an unknown
 parameter, and `existing` on a file with no ground class. CI also runs the
-image through its own entrypoint with only the three options.
+image through its own entrypoint with only the three options and a host's
+`PATH` in place of the image's, as a Compute2 job step has.
 
 ```bash
 docker build -t ground-surfaces:local ground-surfaces

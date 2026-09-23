@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/conda/bin/python
 """Ground, surface and canopy height from one lidar file.
 
 Implements entrypoint contract v1 (fossettlab/geospatial-executor,
