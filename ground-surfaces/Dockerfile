@@ -20,8 +20,11 @@ RUN micromamba install -y -n base -c conda-forge \
         "python-pdal" \
     && micromamba clean -a -y
 
-# The conda env is on PATH directly, so the entrypoint resolves its tools
-# without shell activation whether pyxis runs it or Docker does.
+# The conda env is on PATH for tools run inside the image. The entrypoint does
+# not rely on it: a job step on Compute2 carries the host's PATH rather than
+# this one, and there a `#!/usr/bin/env python3` entrypoint could not find its
+# interpreter. So the ENTRYPOINT is an absolute path and its interpreter line
+# names /opt/conda/bin/python.
 # PYTHONNOUSERSITE stops an enroot $HOME bind-mount from shadowing the env.
 ENV PATH=/opt/conda/bin:$PATH \
     GDAL_DATA=/opt/conda/share/gdal \
@@ -32,18 +35,18 @@ ENV PATH=/opt/conda/bin:$PATH \
 COPY bin/ground-surfaces /usr/local/bin/ground-surfaces
 
 # Offline build check: the bindings the recipe uses import, the COG driver is
-# present, the entrypoint parses, and the SMRF defaults the recipe reports are
-# the ones this PDAL applies (window is not listed by PDAL; it is 18 * cell).
-# No network, no data.
+# present, the entrypoint parses even with an empty environment, and the SMRF
+# defaults the recipe reports are the ones this PDAL applies (window is not
+# listed by PDAL; it is 18 * cell). No network, no data.
 RUN chmod +x /usr/local/bin/ground-surfaces \
     && python -c "from osgeo import gdal; import pdal, numpy; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'" \
     && pdal --version \
     && pdal --options filters.smrf --showjson | python -c "import json, sys; listed = {o['name']: o.get('default') for o in json.load(sys.stdin)[1]}; expected = {'slope': '0.15', 'scalar': '1.25', 'threshold': '0.5', 'cell': '1', 'returns': 'last, only'}; wrong = {k: listed.get(k) for k, v in expected.items() if listed.get(k) != v}; assert not wrong, f'PDAL SMRF defaults changed: {wrong}'" \
-    && ground-surfaces --help >/dev/null \
+    && env -i /usr/local/bin/ground-surfaces --help >/dev/null \
     && echo "ground-surfaces build check passed"
 
 WORKDIR /work
-ENTRYPOINT ["ground-surfaces"]
+ENTRYPOINT ["/usr/local/bin/ground-surfaces"]
 
 LABEL org.opencontainers.image.source="https://github.com/bradleylab/geo-pipelines"
 LABEL org.opencontainers.image.description="DTM, DSM and canopy height model from one lidar file (entrypoint contract v1)"
