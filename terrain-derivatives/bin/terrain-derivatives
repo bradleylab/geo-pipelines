@@ -1,0 +1,399 @@
+#!/opt/conda/bin/python
+"""Terrain derivatives from one elevation model.
+
+Implements entrypoint contract v1 (fossettlab/geospatial-executor,
+docs/contracts/entrypoint-v1.md): exactly three options, the elevation model
+staged under ``<input-dir>/primary/``, and every artifact plus ``run.json``
+written under ``<output-dir>``. The design is
+``docs/atlas_terrain_derivatives_spec_2026-09-26.md`` in fossettlab/atlas-agent.
+
+Slope, aspect, hillshade, roughness, the terrain ruggedness index (TRI) and the
+topographic position index (TPI) come from gdaldem's library form
+(``gdal.DEMProcessing``) on one grid, and contour lines from gdal_contour when
+an interval is given. An optional cell size averages the model onto a coarser
+grid first.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from osgeo import gdal, ogr, osr
+
+gdal.UseExceptions()
+ogr.UseExceptions()
+
+CONTRACT_VERSION = 1
+
+# Bounds and defaults from the registry entry this image serves (spec §3.2).
+RESOLUTION_MAX = 50.0  # ground_surfaces' and laz_to_dem's upper bound
+CONTOUR_INTERVAL_MAX = 100.0  # the operator's bound (spec §7, item 13)
+# Zero stands for "not set": the registry has no optional number.
+RESOLUTION_NATIVE = 0.0
+NO_CONTOURS = 0.0
+GRADIENT_METHODS = {"horn": "Horn", "zevenbergen_thorne": "ZevenbergenThorne"}
+SLOPE_UNITS = {"degrees": "degree", "percent": "percent"}
+# The hillshade task's bounds and gdaldem's defaults: (min, max, default).
+HILLSHADE_PARAMS = {
+    "z_factor": (0.0, 100.0, 1.0),
+    "azimuth": (0.0, 360.0, 315.0),
+    "altitude": (0.0, 90.0, 45.0),
+}
+# gdaldem's default since GDAL 3.3 (TRIAlg::RILEY in gdaldem_lib.cpp), named
+# explicitly so the report does not depend on it.
+TRI_METHOD = "Riley"
+KNOWN_PARAMS = {
+    "resolution",
+    "gradient_method",
+    "slope_units",
+    "contour_interval",
+    *HILLSHADE_PARAMS,
+}
+
+# A grid unit or cell-size comparison closer than this is treated as equal.
+TOLERANCE = 1e-6
+
+COG_OPTIONS = ["COMPRESS=DEFLATE", "OVERVIEWS=AUTO", "NUM_THREADS=ALL_CPUS", "BIGTIFF=IF_SAFER"]
+STAGING_OPTIONS = ["TILED=YES", "BIGTIFF=IF_SAFER"]
+# gdaldem writes -9999 as nodata for every float product; this is the value a
+# resampled model gets where no input cell contributes.
+RESAMPLED_NODATA = -9999.0
+
+# (file, role, gdaldem processing mode)
+RASTERS = (
+    ("slope.tif", "slope", "slope"),
+    ("aspect.tif", "aspect", "aspect"),
+    ("hillshade.tif", "hillshade", "hillshade"),
+    ("roughness.tif", "roughness", "Roughness"),
+    ("tri.tif", "tri", "TRI"),
+    ("tpi.tif", "tpi", "TPI"),
+)
+CONTOURS_FILE, CONTOURS_ROLE = "contours.gpkg", "contours"
+CONTOUR_LAYER, CONTOUR_FIELD = "contour", "elevation_m"
+REPORT_FILE, REPORT_ROLE = "terrain_report.json", "report"
+
+ELEVATION_UNITS = (
+    "elevations are taken to be in meters; a model with elevations in feet gives slopes "
+    "and elevation differences that are wrong by that factor"
+)
+
+
+class Refused(Exception):
+    """Input or parameters this recipe will not run on; the message is for the caller."""
+
+
+@dataclass(frozen=True)
+class Params:
+    resolution: float
+    gradient_method: str
+    slope_units: str
+    z_factor: float
+    azimuth: float
+    altitude: float
+    contour_interval: float
+
+
+@dataclass(frozen=True)
+class Grid:
+    crs: str
+    cell_x: float
+    cell_y: float
+    width: int
+    height: int
+    bounds: tuple[float, float, float, float]  # xmin, ymin, xmax, ymax
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="terrain-derivatives", allow_abbrev=False)
+    parser.add_argument("--input-dir", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--params-json", required=True, type=Path)
+    return parser.parse_args(argv)
+
+
+def _number(raw: Any, name: str, low: float, high: float) -> float:
+    # Contract v1 delivers every validated value as a string.
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise Refused(f"{name} must be a number, got {raw!r}") from None
+    if not math.isfinite(value) or not low <= value <= high:
+        raise Refused(f"{name} must be {low:g}-{high:g}, got {raw!r}")
+    return value
+
+
+def _choice(raw: Any, name: str, choices: dict[str, str]) -> str:
+    value = str(raw)
+    if value not in choices:
+        raise Refused(f"{name} must be one of {sorted(choices)}, got {value!r}")
+    return value
+
+
+def read_params(path: Path) -> Params:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise Refused("params.json must hold a JSON object")
+    unknown = sorted(set(raw) - KNOWN_PARAMS)
+    if unknown:
+        raise Refused(f"unknown parameters {unknown}; this task takes {sorted(KNOWN_PARAMS)}")
+    hillshade = {
+        name: _number(raw.get(name, default), name, low, high)
+        for name, (low, high, default) in HILLSHADE_PARAMS.items()
+    }
+    return Params(
+        resolution=_number(
+            raw.get("resolution", RESOLUTION_NATIVE), "resolution", 0.0, RESOLUTION_MAX
+        ),
+        gradient_method=_choice(
+            raw.get("gradient_method", "horn"), "gradient_method", GRADIENT_METHODS
+        ),
+        slope_units=_choice(raw.get("slope_units", "degrees"), "slope_units", SLOPE_UNITS),
+        contour_interval=_number(
+            raw.get("contour_interval", NO_CONTOURS), "contour_interval", 0.0, CONTOUR_INTERVAL_MAX
+        ),
+        **hillshade,
+    )
+
+
+def find_elevation_model(input_dir: Path) -> Path:
+    primary = input_dir / "primary"
+    files = [p for p in primary.rglob("*") if p.is_file()] if primary.is_dir() else []
+    rasters = [p for p in files if p.suffix.lower() in {".tif", ".tiff"}]
+    if len(rasters) != 1:
+        raise Refused(
+            f"expected exactly one .tif or .tiff file under {primary}, found {len(rasters)}"
+        )
+    return rasters[0]
+
+
+def describe_grid(dataset: gdal.Dataset) -> Grid:
+    """The grid of a north-up raster in a projected CRS with meters; anything else is refused."""
+    wkt = dataset.GetProjection()
+    if not wkt:
+        raise Refused("the elevation model has no CRS; assign one before deriving from it")
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(wkt)
+    if not srs.IsProjected() or abs(srs.GetLinearUnits() - 1.0) > TOLERANCE:
+        raise Refused(
+            "the elevation model is not in a projected CRS in meters, so slopes and cell "
+            "sizes would be meaningless; reproject it first with reproject"
+        )
+    gt = dataset.GetGeoTransform()
+    # gdaldem measures aspect from the top of the raster, which is north only on
+    # a north-up grid.
+    if gt[2] != 0.0 or gt[4] != 0.0:
+        raise Refused("the elevation model has a rotated grid; only north-up grids are supported")
+    xs = (gt[0], gt[0] + dataset.RasterXSize * gt[1])
+    ys = (gt[3], gt[3] + dataset.RasterYSize * gt[5])
+    return Grid(
+        crs=srs.GetName(),
+        cell_x=abs(gt[1]),
+        cell_y=abs(gt[5]),
+        width=dataset.RasterXSize,
+        height=dataset.RasterYSize,
+        bounds=(min(xs), min(ys), max(xs), max(ys)),
+    )
+
+
+def resample(source: Path, target: Path, grid: Grid, resolution: float) -> None:
+    """Average the model onto a coarser grid in its own CRS, edges on multiples of the cell size."""
+    if resolution < max(grid.cell_x, grid.cell_y) * (1 - TOLERANCE):
+        raise Refused(
+            f"resolution {resolution:g} m is finer than the elevation model's "
+            f"{max(grid.cell_x, grid.cell_y):g} m cells; resampling would add no detail"
+        )
+    dataset = gdal.Open(str(source))  # held: a band outlives nothing it belongs to
+    input_nodata = dataset.GetRasterBand(1).GetNoDataValue()
+    gdal.Warp(
+        str(target),
+        str(source),
+        format="GTiff",
+        xRes=resolution,
+        yRes=resolution,
+        targetAlignedPixels=True,
+        resampleAlg="average",
+        srcBands=[1],
+        dstBands=[1],
+        srcNodata=input_nodata,
+        dstNodata=RESAMPLED_NODATA if input_nodata is None else input_nodata,
+        creationOptions=STAGING_OPTIONS,
+    )
+
+
+def derive(model: Path, staging: Path, processing: str, params: Params) -> None:
+    """One gdaldem product, without -compute_edges: incomplete 3 x 3 windows are nodata."""
+    options: dict[str, Any] = {"format": "GTiff", "creationOptions": STAGING_OPTIONS, "band": 1}
+    if processing in {"slope", "aspect", "hillshade"}:
+        options["alg"] = GRADIENT_METHODS[params.gradient_method]
+    if processing == "slope":
+        options["slopeFormat"] = SLOPE_UNITS[params.slope_units]
+    if processing == "hillshade":
+        options |= {
+            "zFactor": params.z_factor,
+            "azimuth": params.azimuth,
+            "altitude": params.altitude,
+        }
+    if processing == "TRI":
+        options["alg"] = TRI_METHOD
+    gdal.DEMProcessing(str(staging), str(model), processing, **options)
+
+
+def to_cog(source: Path, target: Path) -> None:
+    gdal.Translate(str(target), str(source), format="COG", creationOptions=COG_OPTIONS)
+
+
+def raster_summary(path: Path) -> dict[str, Any]:
+    dataset = gdal.Open(str(path))  # held: a band outlives nothing it belongs to
+    band = dataset.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    values = band.ReadAsArray()
+    valid = (
+        values != values.dtype.type(nodata) if nodata is not None else np.ones(values.shape, bool)
+    )
+    kept = values[valid].astype(np.float64)
+    return {
+        "valid_cells": int(kept.size),
+        "nodata_cells": int(values.size - kept.size),
+        "nodata_value": nodata,
+        "min": float(kept.min()) if kept.size else None,
+        "mean": float(kept.mean()) if kept.size else None,
+        "max": float(kept.max()) if kept.size else None,
+    }
+
+
+def write_contours(model: Path, target: Path, interval: float) -> dict[str, Any]:
+    # Called by absolute path: a job step on Compute2 carries the host's PATH,
+    # not the image's, and gdal_contour sits beside this interpreter.
+    gdal_contour = Path(sys.executable).parent / "gdal_contour"
+    subprocess.run(
+        [
+            str(gdal_contour),
+            "-b",
+            "1",
+            "-a",
+            CONTOUR_FIELD,
+            "-i",
+            repr(interval),
+            "-off",
+            "0",
+            "-nln",
+            CONTOUR_LAYER,
+            "-f",
+            "GPKG",
+            str(model),
+            str(target),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source = ogr.Open(str(target))
+    layer = source.GetLayerByName(CONTOUR_LAYER)
+    levels = [feature.GetField(CONTOUR_FIELD) for feature in layer]
+    return {
+        "interval_m": interval,
+        "base_m": 0.0,
+        "lines": len(levels),
+        "lowest_m": min(levels) if levels else None,
+        "highest_m": max(levels) if levels else None,
+    }
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run(input_dir: Path, output_dir: Path, params: Params) -> None:
+    source = find_elevation_model(input_dir)
+    input_grid = describe_grid(gdal.Open(str(source)))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs: list[tuple[str, str]] = []
+    with tempfile.TemporaryDirectory(dir=output_dir) as scratch:
+        work = Path(scratch)
+        model = source
+        if params.resolution != RESOLUTION_NATIVE:
+            model = work / "resampled.tif"
+            resample(source, model, input_grid, params.resolution)
+        grid = describe_grid(gdal.Open(str(model)))
+
+        summaries: dict[str, Any] = {}
+        for name, role, processing in RASTERS:
+            staging = work / name
+            derive(model, staging, processing, params)
+            to_cog(staging, output_dir / name)
+            summaries[role] = raster_summary(output_dir / name)
+            outputs.append((name, role))
+
+        contours: dict[str, Any] | str = "not written"
+        if params.contour_interval != NO_CONTOURS:
+            contours = write_contours(model, output_dir / CONTOURS_FILE, params.contour_interval)
+            outputs.append((CONTOURS_FILE, CONTOURS_ROLE))
+
+    report = {
+        "input": source.name,
+        "band": 1,
+        "input_grid": asdict(input_grid),
+        "resampled": (
+            {
+                "from_cell_m": max(input_grid.cell_x, input_grid.cell_y),
+                "to_cell_m": params.resolution,
+            }
+            if params.resolution != RESOLUTION_NATIVE
+            else "no"
+        ),
+        "grid": asdict(grid),
+        "params": asdict(params),
+        "methods": {
+            "gradient": GRADIENT_METHODS[params.gradient_method],
+            "tri": TRI_METHOD,
+            "edges": "nodata wherever a 3 x 3 window holds a nodata cell, and on the outer ring",
+        },
+        "rasters": summaries,
+        "contours": contours,
+        "elevation_units": ELEVATION_UNITS,
+        "versions": {"gdal": gdal.__version__},
+    }
+    (output_dir / REPORT_FILE).write_text(json.dumps(report, indent=2) + "\n")
+    outputs.append((REPORT_FILE, REPORT_ROLE))
+
+    # The manifest goes last: its presence is what says the run finished.
+    formats = {".tif": "GTiff", ".gpkg": "GPKG"}
+    manifest = {
+        "contract_version": CONTRACT_VERSION,
+        "outputs": [
+            {"path": name, "role": role, "sha256": sha256(output_dir / name)}
+            | ({"format": formats[Path(name).suffix]} if Path(name).suffix in formats else {})
+            for name, role in outputs
+        ],
+    }
+    (output_dir / "run.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        params = read_params(args.params_json)
+        run(args.input_dir, args.output_dir, params)
+    except Refused as exc:
+        print(f"terrain-derivatives: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

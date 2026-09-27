@@ -181,6 +181,44 @@ validated.
 
 ---
 
+## terrain-derivatives
+
+**Purpose.** From one elevation model, slope, aspect, hillshade, roughness, the
+terrain ruggedness index (TRI) and the topographic position index (TPI) on one
+grid, contour lines when an interval is given, and a report. Built to entrypoint
+contract v1, so it carries one task.
+
+**Inputs.** One GeoTIFF in a projected CRS in meters, on a north-up grid, staged
+under `<input-dir>/primary/`; parameters in `params.json`: `resolution`,
+`gradient_method`, `slope_units`, `z_factor`, `azimuth`, `altitude` and
+`contour_interval`, all validated.
+
+**Products.**
+- `slope.tif`, `aspect.tif`, `hillshade.tif`, `roughness.tif`, `tri.tif`,
+  `tpi.tif` → gdaldem products on the input grid (or the resampled one)
+- `contours.gpkg` → contour lines, only when `contour_interval` is above zero
+- `terrain_report.json` → grids, parameters used, each raster's range and
+  nodata count, contour count and range, GDAL version
+- `run.json` → the contract manifest
+
+**Run.** `terrain-derivatives --input-dir <dir> --output-dir <dir>
+--params-json <file>`, the only three options the entrypoint takes.
+
+**Stack.**
+- Base: `mambaorg/micromamba:1.5.10`
+- GDAL 3.9 from conda-forge, as `geo-tools`
+
+**Known boundaries.**
+- Elevations are taken to be in meters; the CRS check covers only the
+  horizontal unit.
+- Every output is nodata wherever its 3 × 3 window is incomplete, including a
+  one-cell border.
+- Curvature is not computed yet.
+
+**Lab status.** Active (v1 in progress). Atlas's third course pipeline.
+
+---
+
 ## snap-insar
 
 **Purpose.** Sentinel-1 InSAR via ESA SNAP 12 + the Sentinel-1 Toolbox:
