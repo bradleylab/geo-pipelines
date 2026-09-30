@@ -1,0 +1,563 @@
+#!/opt/conda/bin/python
+"""The clearest public satellite scene of a site, clipped to it.
+
+Implements entrypoint contract v1 (fossettlab/geospatial-executor,
+docs/contracts/entrypoint-v1.md): exactly three options, a raster of the site
+staged under ``<input-dir>/primary/``, and every artifact plus ``run.json``
+written under ``<output-dir>``. The design is
+``docs/atlas_satellite_fetch_spec_2026-09-30.md`` in fossettlab/atlas-agent.
+
+The scenes come from Microsoft Planetary Computer's STAC API, read with an
+anonymous shared access signature. Items acquired on the same day by the same
+platform form one candidate scene; each candidate is scored by the share of the
+site its own quality layer calls clear, and the highest share wins.
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import hashlib
+import importlib.metadata as im
+import json
+import sys
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from osgeo import gdal, osr
+
+gdal.UseExceptions()
+osr.UseExceptions()
+
+CONTRACT_VERSION = 1
+STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+# Spec §8: the years with data at the lab's sites, and the largest site side.
+YEAR_MIN, YEAR_MAX = 2015, 2035
+MAX_SIDE_M = 25_000.0
+KNOWN_PARAMS = {"product", "year", "month_start", "month_end"}
+DEFAULTS = {"product": "sentinel2_l2a", "month_start": "1", "month_end": "12"}
+
+# From processing baseline 04.00 ESA adds 1000 to every L2A value; the item's
+# s2:processing_baseline is the only sign of it on Planetary Computer (spec §3).
+S2_OFFSET = 1000
+S2_OFFSET_BASELINE = (4, 0)
+# Scene classification: vegetation, not vegetated, water. Class 7 is also
+# ESA's "cloud low probability" and is not counted as clear (spec §4.1).
+SCL_CLEAR = (4, 5, 6)
+SCL_NODATA = 0
+# HLS v2.0 user guide, Fmask bits 1 (cloud), 2 (adjacent) and 3 (shadow).
+FMASK_NOT_CLEAR = (1 << 1) | (1 << 2) | (1 << 3)
+FMASK_FILL = 255
+REFLECTANCE_NODATA = -9999
+S1_SOURCE_NODATA = -32768.0
+
+COG_OPTIONS = ["COMPRESS=DEFLATE", "OVERVIEWS=AUTO", "BIGTIFF=IF_SAFER"]
+GDAL_NETWORK = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.TIF,.tiff",
+    "GDAL_HTTP_MAX_RETRY": "4",
+    "GDAL_HTTP_RETRY_DELAY": "2",
+}
+# Points per footprint edge when a boundary is carried into the output CRS, so
+# a curved edge's extreme is not missed between corners.
+EDGE_POINTS = 21
+
+IMAGERY_FILE, IMAGERY_ROLE = "imagery.tif", "imagery"
+QUALITY_FILE, QUALITY_ROLE = "quality.tif", "quality"
+REPORT_FILE, REPORT_ROLE = "fetch_report.json", "report"
+
+
+HLS, SENTINEL2, SENTINEL1 = "hls", "sentinel2", "sentinel1"
+
+
+@dataclass(frozen=True)
+class Product:
+    """What one product fetches: its collections, bands per collection, and values."""
+
+    kind: str  # HLS, SENTINEL2 or SENTINEL1: how its values and quality are read
+    collections: dict[str, tuple[str, ...]]  # collection -> band assets, in output order
+    band_names: tuple[str, ...]
+    resolution: float
+    data_type: int
+    nodata: float
+    quality: str | None  # the quality asset, or None when the product has none
+    quality_nodata: int | None
+
+
+PRODUCTS = {
+    "hls": Product(
+        kind=HLS,
+        collections={
+            "hls2-s30": ("B02", "B03", "B04", "B8A", "B11", "B12"),
+            "hls2-l30": ("B02", "B03", "B04", "B05", "B06", "B07"),
+        },
+        band_names=("blue", "green", "red", "nir_narrow", "swir1", "swir2"),
+        resolution=30.0,
+        data_type=gdal.GDT_Int16,
+        nodata=REFLECTANCE_NODATA,
+        quality="Fmask",
+        quality_nodata=FMASK_FILL,
+    ),
+    "sentinel2_l2a": Product(
+        kind=SENTINEL2,
+        collections={
+            "sentinel-2-l2a": (
+                "B01",
+                "B02",
+                "B03",
+                "B04",
+                "B05",
+                "B06",
+                "B07",
+                "B08",
+                "B8A",
+                "B09",
+                "B11",
+                "B12",
+            ),
+        },
+        band_names=(
+            "B01",
+            "B02",
+            "B03",
+            "B04",
+            "B05",
+            "B06",
+            "B07",
+            "B08",
+            "B8A",
+            "B09",
+            "B11",
+            "B12",
+        ),
+        resolution=10.0,
+        data_type=gdal.GDT_Int16,
+        nodata=REFLECTANCE_NODATA,
+        quality="SCL",
+        quality_nodata=SCL_NODATA,
+    ),
+    "sentinel1_rtc": Product(
+        kind=SENTINEL1,
+        collections={"sentinel-1-rtc": ("vv", "vh")},
+        band_names=("VV", "VH"),
+        resolution=10.0,
+        data_type=gdal.GDT_Float32,
+        nodata=float("nan"),
+        quality=None,
+        quality_nodata=None,
+    ),
+}
+
+
+class Refused(Exception):
+    """Input or parameters this recipe will not run on; the message is for the caller."""
+
+
+@dataclass(frozen=True)
+class Params:
+    product: str
+    year: int
+    month_start: int
+    month_end: int
+
+
+@dataclass(frozen=True)
+class Grid:
+    epsg: int
+    resolution: float
+    bounds: tuple[float, float, float, float]  # xmin, ymin, xmax, ymax
+    width: int
+    height: int
+    footprint_wgs84: tuple[float, float, float, float]  # west, south, east, north
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="satellite-fetch", allow_abbrev=False)
+    parser.add_argument("--input-dir", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--params-json", required=True, type=Path)
+    return parser.parse_args(argv)
+
+
+def _whole(raw: Any, name: str, low: int, high: int) -> int:
+    # Contract v1 delivers every validated value as a string.
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise Refused(f"{name} must be a number, got {raw!r}") from None
+    if not value.is_integer() or not low <= value <= high:
+        raise Refused(f"{name} must be a whole number {low}-{high}, got {raw!r}")
+    return int(value)
+
+
+def read_params(path: Path) -> Params:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise Refused("params.json must hold a JSON object")
+    unknown = sorted(set(raw) - KNOWN_PARAMS)
+    if unknown:
+        raise Refused(f"unknown parameters {unknown}; this task takes {sorted(KNOWN_PARAMS)}")
+    if "year" not in raw:
+        raise Refused("year is required")
+    values = DEFAULTS | raw
+    product = str(values["product"])
+    if product not in PRODUCTS:
+        raise Refused(f"product must be one of {sorted(PRODUCTS)}, got {product!r}")
+    params = Params(
+        product=product,
+        year=_whole(values["year"], "year", YEAR_MIN, YEAR_MAX),
+        month_start=_whole(values["month_start"], "month_start", 1, 12),
+        month_end=_whole(values["month_end"], "month_end", 1, 12),
+    )
+    if params.month_start > params.month_end:
+        raise Refused(
+            f"month_start ({params.month_start}) comes after month_end ({params.month_end})"
+        )
+    return params
+
+
+def find_site(input_dir: Path) -> Path:
+    candidates = sorted((input_dir / "primary").glob("*.tif")) + sorted(
+        (input_dir / "primary").glob("*.tiff")
+    )
+    if len(candidates) != 1:
+        raise Refused(
+            f"expected exactly one GeoTIFF under {input_dir / 'primary'}, found {len(candidates)}"
+        )
+    return candidates[0]
+
+
+def _boundary(xmin: float, ymin: float, xmax: float, ymax: float) -> list[tuple[float, float]]:
+    steps = np.linspace(0.0, 1.0, EDGE_POINTS)
+    xs, ys = xmin + (xmax - xmin) * steps, ymin + (ymax - ymin) * steps
+    return (
+        [(x, ymin) for x in xs]
+        + [(xmax, y) for y in ys]
+        + [(x, ymax) for x in xs]
+        + [(xmin, y) for y in ys]
+    )
+
+
+def _carry(
+    points: list[tuple[float, float]], source: osr.SpatialReference, epsg: int
+) -> np.ndarray:
+    target = osr.SpatialReference()
+    target.ImportFromEPSG(epsg)
+    for srs in (source, target):
+        srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    transform = osr.CoordinateTransformation(source, target)
+    return np.array([transform.TransformPoint(x, y)[:2] for x, y in points])
+
+
+def site_grid(site: Path, resolution: float) -> Grid:
+    """The output grid: the site's bounding box in its center's UTM zone, whole cells."""
+    dataset = gdal.Open(str(site))
+    wkt = dataset.GetProjection()
+    if not wkt:
+        raise Refused("the site raster has no CRS; assign one before fetching for it")
+    source = osr.SpatialReference(wkt=wkt)
+    x0, dx, rx, y0, ry, dy = dataset.GetGeoTransform()
+    if rx or ry:
+        raise Refused("the site raster has a rotated grid; only north-up grids are supported")
+    x1, y1 = x0 + dx * dataset.RasterXSize, y0 + dy * dataset.RasterYSize
+    boundary = _boundary(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    lonlat = _carry(boundary, source, 4326)
+    west, south = lonlat.min(axis=0)
+    east, north = lonlat.max(axis=0)
+    lon, lat = (west + east) / 2, (south + north) / 2
+    zone = int((lon + 180) // 6) + 1
+    epsg = (32600 if lat >= 0 else 32700) + zone
+    xy = _carry(boundary, source, epsg)
+    xmin, ymin = np.floor(xy.min(axis=0) / resolution) * resolution
+    xmax, ymax = np.ceil(xy.max(axis=0) / resolution) * resolution
+    side = max(xmax - xmin, ymax - ymin)
+    if side > MAX_SIDE_M:
+        raise Refused(
+            f"the site is {side / 1000:.1f} km on its longer side; the limit is "
+            f"{MAX_SIDE_M / 1000:g} km"
+        )
+    return Grid(
+        epsg=int(epsg),
+        resolution=resolution,
+        bounds=(float(xmin), float(ymin), float(xmax), float(ymax)),
+        width=int(round((xmax - xmin) / resolution)),
+        height=int(round((ymax - ymin) / resolution)),
+        footprint_wgs84=(float(west), float(south), float(east), float(north)),
+    )
+
+
+def search(product: Product, grid: Grid, params: Params) -> list[Any]:
+    from pystac_client import Client
+
+    last_day = calendar.monthrange(params.year, params.month_end)[1]
+    window = (
+        f"{params.year}-{params.month_start:02d}-01T00:00:00Z/"
+        f"{params.year}-{params.month_end:02d}-{last_day:02d}T23:59:59Z"
+    )
+    client = Client.open(STAC_URL)
+    found = client.search(
+        collections=list(product.collections), bbox=grid.footprint_wgs84, datetime=window
+    )
+    return list(found.items())
+
+
+def candidate_groups(product: Product, items: list[Any]) -> dict[tuple[str, str, str], list[Any]]:
+    """Items grouped by collection, platform and acquisition day; items missing a band dropped."""
+    groups: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
+    for item in items:
+        needed = product.collections[item.collection_id] + (
+            (product.quality,) if product.quality else ()
+        )
+        if not all(key in item.assets for key in needed):
+            continue
+        day = item.datetime.date().isoformat()
+        groups[(item.collection_id, str(item.properties.get("platform", "")), day)].append(item)
+    return dict(sorted(groups.items(), key=lambda pair: pair[0][2]))
+
+
+def _signed(href: str) -> str:
+    import planetary_computer
+
+    return "/vsicurl/" + planetary_computer.sign(href)
+
+
+def warp(
+    href: str, grid: Grid, data_type: int, src_nodata: float | None, dst_nodata: float
+) -> np.ndarray:
+    """One asset read onto the grid by nearest neighbor; cells it does not cover get dst_nodata."""
+    options = gdal.WarpOptions(
+        format="MEM",
+        outputBounds=grid.bounds,
+        xRes=grid.resolution,
+        yRes=grid.resolution,
+        dstSRS=f"EPSG:{grid.epsg}",
+        resampleAlg="near",
+        outputType=data_type,
+        srcNodata=src_nodata,
+        dstNodata=dst_nodata,
+        multithread=True,
+    )
+    return gdal.Warp("", _signed(href), options=options).ReadAsArray()
+
+
+def s2_offset(item: Any) -> int:
+    baseline = str(item.properties.get("s2:processing_baseline", "00.00"))
+    major, minor = (int(part) for part in baseline.split(".")[:2])
+    return S2_OFFSET if (major, minor) >= S2_OFFSET_BASELINE else 0
+
+
+def clear_and_covered(product: Product, quality: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-cell masks: the cell holds data, and the scene's own quality layer calls it clear."""
+    if product.kind == HLS:
+        covered = quality != FMASK_FILL
+        return covered & ((quality & FMASK_NOT_CLEAR) == 0), covered
+    if product.kind == SENTINEL2:
+        covered = quality != SCL_NODATA
+        return np.isin(quality, SCL_CLEAR), covered
+    covered = np.isfinite(quality) & (quality != S1_SOURCE_NODATA)
+    return covered, covered
+
+
+def _first_valid(layers: list[np.ndarray], valid: list[np.ndarray], fill: float) -> np.ndarray:
+    out = np.full(layers[0].shape, fill, dtype=layers[0].dtype)
+    taken = np.zeros(layers[0].shape, dtype=bool)
+    for layer, ok in zip(layers, valid, strict=True):
+        pick = ok & ~taken
+        out[pick] = layer[pick]
+        taken |= pick
+    return out
+
+
+def quality_of(product: Product, items: list[Any], grid: Grid) -> np.ndarray:
+    """The group's quality layer on the grid (for Sentinel-1, its VV band), items merged."""
+    if product.quality is None:
+        layers = [
+            warp(i.assets["vv"].href, grid, gdal.GDT_Float32, S1_SOURCE_NODATA, S1_SOURCE_NODATA)
+            for i in items
+        ]
+        return _first_valid(
+            layers, [clear_and_covered(product, q)[1] for q in layers], S1_SOURCE_NODATA
+        )
+    fill = product.quality_nodata
+    layers = [warp(i.assets[product.quality].href, grid, gdal.GDT_Byte, fill, fill) for i in items]
+    return _first_valid(layers, [layer != fill for layer in layers], fill)
+
+
+def score(product: Product, items: list[Any], grid: Grid) -> dict[str, float]:
+    clear, covered = clear_and_covered(product, quality_of(product, items, grid))
+    cells = grid.width * grid.height
+    return {"clear": float(clear.sum() / cells), "covered": float(covered.sum() / cells)}
+
+
+def band_stack(product: Product, items: list[Any], grid: Grid) -> np.ndarray:
+    """(bands, rows, cols) in product order, items merged, values as §4.3 of the spec says."""
+    bands = []
+    for index in range(len(product.band_names)):
+        layers, valid = [], []
+        for item in items:
+            asset = product.collections[item.collection_id][index]
+            href = item.assets[asset].href
+            if product.kind == SENTINEL2:
+                raw = warp(href, grid, gdal.GDT_Int32, 0, 0)
+                ok = raw > 0
+                layers.append(
+                    np.where(ok, raw - s2_offset(item), REFLECTANCE_NODATA).astype(np.int16)
+                )
+            elif product.kind == HLS:
+                raw = warp(href, grid, gdal.GDT_Int16, REFLECTANCE_NODATA, REFLECTANCE_NODATA)
+                ok = raw != REFLECTANCE_NODATA
+                layers.append(raw)
+            else:
+                raw = warp(href, grid, gdal.GDT_Float32, S1_SOURCE_NODATA, S1_SOURCE_NODATA)
+                ok = np.isfinite(raw) & (raw != S1_SOURCE_NODATA)
+                layers.append(np.where(ok, raw, np.nan).astype(np.float32))
+            valid.append(ok)
+        bands.append(_first_valid(layers, valid, product.nodata))
+    return np.stack(bands)
+
+
+def write_cog(
+    path: Path, array: np.ndarray, grid: Grid, data_type: int, nodata: float, names: tuple[str, ...]
+) -> None:
+    driver = gdal.GetDriverByName("MEM")
+    bands = array.shape[0]
+    staging = driver.Create("", grid.width, grid.height, bands, data_type)
+    xmin, _, _, ymax = grid.bounds
+    staging.SetGeoTransform((xmin, grid.resolution, 0.0, ymax, 0.0, -grid.resolution))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(grid.epsg)
+    staging.SetProjection(srs.ExportToWkt())
+    for index in range(bands):
+        band = staging.GetRasterBand(index + 1)
+        band.WriteArray(array[index])
+        band.SetNoDataValue(nodata)
+        band.SetDescription(names[index])
+    predictor = "3" if data_type == gdal.GDT_Float32 else "2"
+    gdal.Translate(
+        str(path), staging, format="COG", creationOptions=COG_OPTIONS + [f"PREDICTOR={predictor}"]
+    )
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _describe(
+    key: tuple[str, str, str], items: list[Any], scores: dict[str, float]
+) -> dict[str, Any]:
+    collection, platform, day = key
+    return {
+        "collection": collection,
+        "platform": platform,
+        "date": day,
+        "items": [
+            {
+                "id": item.id,
+                "datetime": item.datetime.isoformat(),
+                "processing_baseline": item.properties.get("s2:processing_baseline"),
+            }
+            for item in items
+        ],
+        **scores,
+    }
+
+
+def run(input_dir: Path, output_dir: Path, params: Params) -> None:
+    for key, value in GDAL_NETWORK.items():
+        gdal.SetConfigOption(key, value)
+    product = PRODUCTS[params.product]
+    site = find_site(input_dir)
+    grid = site_grid(site, product.resolution)
+    groups = candidate_groups(product, search(product, grid, params))
+    window = f"{params.year}, months {params.month_start}-{params.month_end}"
+    if not groups:
+        raise Refused(f"no {params.product} scenes cover the site in {window}")
+    scored = [(key, items, score(product, items, grid)) for key, items in groups.items()]
+    covering = [entry for entry in scored if entry[2]["covered"] > 0]
+    if not covering:
+        raise Refused(f"no {params.product} scene in {window} holds data over the site")
+    # Highest clear share; on a tie, the earlier date (the list is in date order).
+    key, items, chosen = max(covering, key=lambda entry: entry[2]["clear"])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs: list[tuple[str, str]] = []
+    write_cog(
+        output_dir / IMAGERY_FILE,
+        band_stack(product, items, grid),
+        grid,
+        product.data_type,
+        product.nodata,
+        product.band_names,
+    )
+    outputs.append((IMAGERY_FILE, IMAGERY_ROLE))
+    if product.quality is not None:
+        quality = quality_of(product, items, grid)[np.newaxis]
+        write_cog(
+            output_dir / QUALITY_FILE,
+            quality,
+            grid,
+            gdal.GDT_Byte,
+            product.quality_nodata,
+            (product.quality,),
+        )
+        outputs.append((QUALITY_FILE, QUALITY_ROLE))
+
+    report = {
+        "input": site.name,
+        "catalog": STAC_URL,
+        "params": asdict(params),
+        "grid": asdict(grid),
+        "chosen": _describe(key, items, chosen),
+        "offset_removed": (
+            [s2_offset(item) for item in items] if product.kind == SENTINEL2 else None
+        ),
+        "candidates": [_describe(k, i, s) for k, i, s in scored],
+        "bands": [
+            {
+                "name": name,
+                **{collection: assets[index] for collection, assets in product.collections.items()},
+            }
+            for index, name in enumerate(product.band_names)
+        ],
+        "versions": {
+            "gdal": gdal.__version__,
+            **{package: im.version(package) for package in ("pystac-client", "planetary-computer")},
+        },
+    }
+    (output_dir / REPORT_FILE).write_text(json.dumps(report, indent=2) + "\n")
+    outputs.append((REPORT_FILE, REPORT_ROLE))
+
+    # The manifest goes last: its presence is what says the run finished.
+    formats = {".tif": "GTiff"}
+    manifest = {
+        "contract_version": CONTRACT_VERSION,
+        "outputs": [
+            {"path": name, "role": role, "sha256": sha256(output_dir / name)}
+            | ({"format": formats[Path(name).suffix]} if Path(name).suffix in formats else {})
+            for name, role in outputs
+        ],
+    }
+    (output_dir / "run.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        params = read_params(args.params_json)
+        run(args.input_dir, args.output_dir, params)
+    except Refused as exc:
+        print(f"satellite-fetch: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -219,6 +219,47 @@ under `<input-dir>/primary/`; parameters in `params.json`: `resolution`,
 
 ---
 
+## satellite-fetch
+
+**Purpose.** The clearest public satellite scene of a site, clipped to it:
+HLS, Sentinel-2 L2A or Sentinel-1 RTC from Microsoft Planetary Computer, as the
+input of models that take satellite imagery the lab does not hold (Prithvi-EO,
+TerraMind, CROMA). Built to entrypoint contract v1, so it carries one task.
+
+**Inputs.** One GeoTIFF of the site with a CRS, staged under
+`<input-dir>/primary/`; its footprint is the area fetched, up to 25 km on a
+side. Parameters in `params.json`: `product`, `year` and `month_start` /
+`month_end`, all validated.
+
+**Products.**
+- `imagery.tif` → the chosen scene's bands on a UTM grid over the site: HLS six
+  bands at 30 m, Sentinel-2 twelve bands at 10 m with the baseline 04.00 offset
+  removed, or Sentinel-1 VV and VH gamma-naught at 10 m
+- `quality.tif` → the scene's `Fmask` or `SCL` on the same grid (not for
+  Sentinel-1)
+- `fetch_report.json` → the chosen items and every candidate with its clear
+  share, the grid, the band table, versions
+- `run.json` → the contract manifest
+
+**Run.** `satellite-fetch --input-dir <dir> --output-dir <dir> --params-json
+<file>`, the only three options the entrypoint takes. Needs outbound HTTPS.
+
+**Stack.**
+- Base: `mambaorg/micromamba:1.5.10`
+- GDAL 3.9 from conda-forge, as `geo-tools`
+- `pystac-client` 0.9.0, `planetary-computer` 1.0.0
+
+**Known boundaries.**
+- The choice trusts each scene's own cloud mask.
+- On Planetary Computer, Sentinel-2-based HLS begins in 2020 at the lab's
+  sites.
+- A catalog can reprocess an item under the same id, so reruns are traced by id
+  rather than checksum.
+
+**Lab status.** Active (v1 in progress). Supplies the remote-sensing models.
+
+---
+
 ## snap-insar
 
 **Purpose.** Sentinel-1 InSAR via ESA SNAP 12 + the Sentinel-1 Toolbox:
