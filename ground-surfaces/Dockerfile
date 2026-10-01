@@ -10,7 +10,9 @@ FROM mambaorg/micromamba:1.5.10
 USER root
 
 # The same pinned GDAL + PDAL minor series as geo-tools, so a surface built here
-# and one built by laz_to_dem come from the same libraries.
+# and one built by laz_to_dem come from the same libraries. matplotlib-base
+# (matplotlib without a GUI) is there only for its viridis table, which colors
+# the CHM preview; GDAL ships no named colormaps.
 ARG GDAL_VERSION=3.9
 ARG PDAL_VERSION=2.8
 RUN micromamba install -y -n base -c conda-forge \
@@ -18,6 +20,7 @@ RUN micromamba install -y -n base -c conda-forge \
         "gdal=${GDAL_VERSION}" \
         "pdal=${PDAL_VERSION}" \
         "python-pdal" \
+        "matplotlib-base" \
     && micromamba clean -a -y
 
 # The conda env is on PATH for tools run inside the image. The entrypoint does
@@ -25,21 +28,24 @@ RUN micromamba install -y -n base -c conda-forge \
 # this one, and there a `#!/usr/bin/env python3` entrypoint could not find its
 # interpreter. So the ENTRYPOINT is an absolute path and its interpreter line
 # names /opt/conda/bin/python.
-# PYTHONNOUSERSITE stops an enroot $HOME bind-mount from shadowing the env.
+# PYTHONNOUSERSITE stops an enroot $HOME bind-mount from shadowing the env, and
+# MPLCONFIGDIR keeps matplotlib from writing its config folder into that home.
 ENV PATH=/opt/conda/bin:$PATH \
     GDAL_DATA=/opt/conda/share/gdal \
     PROJ_DATA=/opt/conda/share/proj \
     PYTHONNOUSERSITE=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLCONFIGDIR=/tmp/matplotlib
 
 COPY bin/ground-surfaces /usr/local/bin/ground-surfaces
 
-# Offline build check: the bindings the recipe uses import, the COG driver is
-# present, the entrypoint parses even with an empty environment, and the SMRF
-# defaults the recipe reports are the ones this PDAL applies (window is not
-# listed by PDAL; it is 18 * cell). No network, no data.
+# Offline build check: the bindings the recipe uses import, the COG and PNG
+# drivers and the viridis colormap are present, the entrypoint parses even with
+# an empty environment, and the SMRF defaults the recipe reports are the ones
+# this PDAL applies (window is not listed by PDAL; it is 18 * cell). No network,
+# no data.
 RUN chmod +x /usr/local/bin/ground-surfaces \
-    && python -c "from osgeo import gdal; import pdal, numpy; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'" \
+    && python -c "from osgeo import gdal; import pdal, numpy, matplotlib; assert all(gdal.GetDriverByName(d) is not None for d in ('COG', 'PNG')), 'COG or PNG driver missing'; matplotlib.colormaps['viridis']" \
     && pdal --version \
     && pdal --options filters.smrf --showjson | python -c "import json, sys; listed = {o['name']: o.get('default') for o in json.load(sys.stdin)[1]}; expected = {'slope': '0.15', 'scalar': '1.25', 'threshold': '0.5', 'cell': '1', 'returns': 'last, only'}; wrong = {k: listed.get(k) for k, v in expected.items() if listed.get(k) != v}; assert not wrong, f'PDAL SMRF defaults changed: {wrong}'" \
     && env -i /usr/local/bin/ground-surfaces --help >/dev/null \

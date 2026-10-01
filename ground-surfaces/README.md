@@ -3,7 +3,8 @@
 From one lidar point cloud, three elevation rasters on one grid: a bare-ground
 digital terrain model (DTM), a top-surface digital surface model (DSM), and a
 canopy height model (CHM, equal to DSM − DTM), with a report of how the ground
-was found and how many returns went into each surface.
+was found and how many returns went into each surface. A small colored PNG of
+the CHM comes with them, for a chat interface to show inline.
 
 The image is built to entrypoint contract v1 (`docs/contracts/entrypoint-v1.md`
 in `fossettlab/geospatial-executor`). The contract passes an image three
@@ -23,6 +24,8 @@ own ground classification instead of recomputing it.
 - `mambaorg/micromamba:1.5.10`
 - GDAL 3.9 and PDAL 2.8 from conda-forge, the same minor series as
   `geo-tools`. The report records the exact versions a run used.
+- `matplotlib-base` from conda-forge, used only for its viridis colormap; GDAL
+  ships no named colormaps. The report records its version too.
 
 ## What a run does
 
@@ -46,6 +49,16 @@ own ground classification instead of recomputing it.
 6. Computes the CHM as DSM − DTM, with nodata where either surface is nodata.
    Cells where the interpolated DTM lies above the DSM keep their negative
    values; the report counts them and the manifest warns.
+7. Draws the CHM as `chm_preview.png`. A grid whose longer side exceeds 1024
+   cells is averaged down, keeping its aspect ratio, until that side is 1024
+   pixels; nodata cells are left out of each average. A smaller grid is drawn
+   cell for cell and never enlarged. Heights are colored with matplotlib's
+   viridis colormap, stretched linearly from 0 m (the first color) to the 99th
+   percentile of the CHM's valid cells (the last color); heights below 0 m take
+   the first color and heights above the 99th percentile the last. A pixel with
+   no CHM value under it is fully transparent. When the 99th percentile is 0 m
+   or below, as over bare ground, there is no range to stretch over: heights
+   above 0 m take the last color and the rest the first.
 
 ## Parameters
 
@@ -72,8 +85,9 @@ deployment wants them, belong in its registry entry.
 | `dtm.tif` | `dtm` | bare-ground elevation, Cloud-Optimized GeoTIFF, Float32, nodata −9999 |
 | `dsm.tif` | `dsm` | top-surface elevation, same grid and format |
 | `chm.tif` | `chm` | height above ground, same grid and format |
-| `surfaces_report.json` | `report` | returns read by class; noise left out and how it was found; returns in each surface; the SMRF values used; the grid; nodata cells per raster; CHM minimum, mean, maximum and negative cells; PDAL and GDAL versions |
-| `run.json` | — | the contract manifest, written last, with each output's role and sha256 |
+| `chm_preview.png` | `preview` | the CHM as an 8-bit RGBA PNG, longest side at most 1024 px: viridis from 0 m to the CHM's 99th percentile, nodata transparent |
+| `surfaces_report.json` | `report` | returns read by class; noise left out and how it was found; returns in each surface; the SMRF values used; the grid; nodata cells per raster; CHM minimum, mean, maximum and negative cells; the preview's file name, size in pixels, downsampling factor, colormap and stretch (0 m and the 99th-percentile height, in meters); PDAL, GDAL and matplotlib versions |
+| `run.json` | — | the contract manifest, written last, with each output's role and sha256, and the format of each raster and of the preview |
 
 A refused run exits 2 with the reason on standard error and writes no
 manifest.
@@ -82,7 +96,7 @@ manifest.
 
 ```bash
 # input/primary/cloud.laz, and params.json such as {"resolution": "1.0"}
-docker run --rm -v "$PWD:/work" ghcr.io/bradleylab/ground-surfaces:v2 \
+docker run --rm -v "$PWD:/work" ghcr.io/bradleylab/ground-surfaces:v3 \
   --input-dir /work/input \
   --output-dir /work/output \
   --params-json /work/params.json
@@ -100,21 +114,27 @@ interpreter line are absolute paths.
 ```bash
 # One-time per version: import the GHCR image to a .sqsh cache
 ssh pliny 'ssh c2 "enroot import \
-  -o /storage3/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+ground-surfaces+v2.sqsh \
-  'docker://ghcr.io#bradleylab/ground-surfaces:v2'"'
+  -o /storage3/fs1/alexander.s.bradley/Active/c2_jobs/bradleylab+ground-surfaces+v3.sqsh \
+  'docker://ghcr.io#bradleylab/ground-surfaces:v3'"'
 ```
 
 ## Tests
 
 `tests/smoke.py` runs inside the built image. It builds synthetic clouds in
 EPSG:32615 whose surfaces are known exactly: a flat ground plane at 100 m, an
-8 m block of canopy over part of it with ground returns beneath, and one
-isolated return at 180 m. It checks that the DTM is the plane, that the CHM's
-maximum is 8 m, that the DSM never reaches 180 m, that the three rasters share
-one grid, that the manifest's checksums match, and that the report names the
-SMRF values used. It runs the unclassified, classified, supplied-parameter and
-existing-ground cases, and checks three refusals: a geographic CRS, an unknown
-parameter, and `existing` on a file with no ground class. CI also runs the
+8 m block of canopy over part of it with ground returns beneath, one isolated
+return at 180 m, and a 6 m corner with no returns. It checks that the DTM is
+the plane, that the CHM's maximum is 8 m, that the DSM never reaches 180 m,
+that the three rasters share one grid, that the manifest's checksums match, and
+that the report names the SMRF values used. For the preview it checks that
+`chm_preview.png` is a four-band 8-bit PNG no longer than 1024 px on a side,
+drawn cell for cell from this small CHM, transparent exactly where the CHM has
+no value, and listed in the manifest with role `preview`, and that the report
+gives its stretch as 0 m to 8 m: the canopy covers more than 1% of the valid
+cells, so its height is the 99th percentile. It runs the unclassified,
+classified, supplied-parameter and existing-ground cases, and checks three
+refusals: a geographic CRS, an unknown parameter, and `existing` on a file
+with no ground class. CI also runs the
 image through its own entrypoint with only the three options and a host's
 `PATH` in place of the image's, as a Compute2 job step has.
 
