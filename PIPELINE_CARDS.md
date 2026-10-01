@@ -149,7 +149,8 @@ recipe accepts a free-form gdal/pdal string; commands run as an argv list.
 
 **Purpose.** From one lidar point cloud, a bare-ground DTM, a top-surface DSM
 and a canopy height model (CHM = DSM − DTM) on one grid, with a report of how
-the ground was found. Built to entrypoint contract v1, so it carries one task.
+the ground was found and a PNG preview of the CHM. Built to entrypoint
+contract v1, so it carries one task.
 
 **Inputs.** One `.las` or `.laz` file in a projected CRS in meters, staged
 under `<input-dir>/primary/`; parameters in `params.json`: `resolution`,
@@ -160,8 +161,11 @@ validated.
 - `dtm.tif` → ground returns, IDW grid
 - `dsm.tif` → highest non-noise return in each cell
 - `chm.tif` → DSM − DTM; negative cells kept and counted
+- `chm_preview.png` → the CHM in viridis from 0 m to its 99th percentile,
+  nodata transparent, averaged down to at most 1024 px on a side
 - `surfaces_report.json` → returns by class, noise left out, SMRF values used,
-  grid, nodata counts, CHM statistics, PDAL and GDAL versions
+  grid, nodata counts, CHM statistics, the preview's size and stretch, PDAL,
+  GDAL and matplotlib versions
 - `run.json` → the contract manifest
 
 **Run.** `ground-surfaces --input-dir <dir> --output-dir <dir> --params-json
@@ -170,6 +174,7 @@ validated.
 **Stack.**
 - Base: `mambaorg/micromamba:1.5.10`
 - GDAL 3.9 + PDAL 2.8 from conda-forge, as `geo-tools`
+- `matplotlib-base` from conda-forge, for the viridis colormap only
 
 **Known boundaries.**
 - Noise is ASPRS classes 7 and 18 in a classified file; in an unclassified

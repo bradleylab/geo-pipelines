@@ -11,6 +11,7 @@ Three rasters share one grid: a DTM (ground returns, inverse-distance
 weighting), a DSM (the highest non-noise return in each cell) and a CHM
 (DSM minus DTM). Noise never reaches a surface. The ground comes either from
 SMRF (Pingel et al. 2013) run afresh or from the file's own class 2 returns.
+A small PNG of the CHM accompanies them, for showing inline in a chat.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib
 import numpy as np
 import pdal
 from osgeo import gdal, osr
@@ -66,12 +68,21 @@ NODATA = -9999.0
 COG_OPTIONS = ["COMPRESS=DEFLATE", "OVERVIEWS=AUTO", "NUM_THREADS=ALL_CPUS", "BIGTIFF=IF_SAFER"]
 STRIPE_ROWS = 512  # keeps a very fine grid's CHM pass to tens of megabytes
 
+# The CHM preview: viridis, stretched from the ground (0 m) to the 99th
+# percentile of the valid cells, longest side at most 1024 px. The colors are
+# matplotlib's own viridis table (lib/matplotlib/_cm_listed.py), not a copy.
+PREVIEW_MAX_SIDE = 1024
+PREVIEW_COLORMAP = "viridis"
+PREVIEW_PERCENTILE = 99
+
 OUTPUTS = (
     ("dtm.tif", "dtm"),
     ("dsm.tif", "dsm"),
     ("chm.tif", "chm"),
+    ("chm_preview.png", "preview"),
     ("surfaces_report.json", "report"),
 )
+FORMATS = {".tif": "GTiff", ".png": "PNG"}
 
 
 class Refused(Exception):
@@ -291,6 +302,51 @@ def write_chm(dtm_path: Path, dsm_path: Path, target: Path) -> dict[str, Any]:
     }
 
 
+def stretch(heights: np.ndarray, top: float | None) -> np.ndarray:
+    """Heights to 0-1 for the colormap: 0 m and below to 0, ``top`` and above to 1."""
+    if top is None or top <= 0:
+        # Nothing to stretch over (a bare-ground CHM): a height above 0 is
+        # above the stretch, and the rest is at or below the ground.
+        return (heights > 0).astype(np.float32)
+    return np.clip(heights / top, 0.0, 1.0)
+
+
+def write_preview(chm_path: Path, target: Path) -> dict[str, Any]:
+    """The CHM as an RGBA PNG, nodata transparent, averaged down but never enlarged."""
+    # Without OVERVIEW_LEVEL=NONE a downsampled read would come from chm.tif's
+    # COG overviews, resampled the COG driver's way, not from the CHM's cells.
+    chm = gdal.OpenEx(str(chm_path), open_options=["OVERVIEW_LEVEL=NONE"])
+    band = chm.GetRasterBand(1)
+    values = band.ReadAsArray()
+    cells = values[values != np.float32(NODATA)]
+    top = float(np.percentile(cells, PREVIEW_PERCENTILE)) if cells.size else None
+    del values, cells
+
+    factor = max(1.0, max(chm.RasterXSize, chm.RasterYSize) / PREVIEW_MAX_SIDE)
+    width = max(1, round(chm.RasterXSize / factor))
+    height = max(1, round(chm.RasterYSize / factor))
+    # GDAL's average leaves nodata cells out; a pixel is nodata only when
+    # every cell under it is.
+    heights = band.ReadAsArray(buf_xsize=width, buf_ysize=height, resample_alg=gdal.GRIORA_Average)
+    rgba = matplotlib.colormaps[PREVIEW_COLORMAP](stretch(heights, top), bytes=True)
+    rgba[heights == np.float32(NODATA)] = 0
+
+    image = gdal.GetDriverByName("MEM").Create("", width, height, 4, gdal.GDT_Byte)
+    for index in range(4):
+        image.GetRasterBand(index + 1).WriteArray(rgba[:, :, index])
+    gdal.GetDriverByName("PNG").CreateCopy(str(target), image)
+    return {
+        "file": target.name,
+        "width_px": width,
+        "height_px": height,
+        "downsampling_factor": factor,
+        "colormap": PREVIEW_COLORMAP,
+        "stretch_low_m": 0.0,
+        "stretch_high_m": top,
+        "stretch_high": f"{PREVIEW_PERCENTILE}th percentile of the valid CHM cells",
+    }
+
+
 def class_counts(points: np.ndarray) -> dict[str, int]:
     values, counts = np.unique(points["Classification"], return_counts=True)
     return {str(int(v)): int(c) for v, c in zip(values, counts, strict=True)}
@@ -326,6 +382,7 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
         to_cog(work / "dtm.tif", output_dir / "dtm.tif")
         to_cog(work / "dsm.tif", output_dir / "dsm.tif")
     chm = write_chm(output_dir / "dtm.tif", output_dir / "dsm.tif", output_dir / "chm.tif")
+    preview = write_preview(output_dir / "chm.tif", output_dir / "chm_preview.png")
 
     report = {
         "input": source.name,
@@ -357,7 +414,12 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
             "chm": nodata_count(output_dir / "chm.tif"),
         },
         "chm": chm,
-        "versions": {"pdal": pdal.info.version, "gdal": gdal.__version__},
+        "preview": preview,
+        "versions": {
+            "pdal": pdal.info.version,
+            "gdal": gdal.__version__,
+            "matplotlib": matplotlib.__version__,
+        },
     }
     (output_dir / "surfaces_report.json").write_text(json.dumps(report, indent=2) + "\n")
 
@@ -366,7 +428,7 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
         "contract_version": CONTRACT_VERSION,
         "outputs": [
             {"path": name, "role": role, "sha256": sha256(output_dir / name)}
-            | ({"format": "GTiff"} if name.endswith(".tif") else {})
+            | ({"format": FORMATS[Path(name).suffix]} if Path(name).suffix in FORMATS else {})
             for name, role in OUTPUTS
         ],
     }

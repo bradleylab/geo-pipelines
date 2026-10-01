@@ -9,9 +9,10 @@ so CI can also drive the image's real ENTRYPOINT against them.
 
 The cloud: a flat ground plane, an 8 m block of canopy over part of it with
 ground returns beneath (as a lidar pulse reaches the ground through
-vegetation), and one isolated return far above everything. The DTM must be
-the plane, the CHM's maximum must be the canopy height, and the DSM must not
-see the isolated return.
+vegetation), one isolated return far above everything, and one corner with no
+returns at all. The DTM must be the plane, the CHM's maximum must be the canopy
+height, the DSM must not see the isolated return, and the preview must be
+transparent over the empty corner.
 """
 
 from __future__ import annotations
@@ -39,8 +40,13 @@ GROUND_Z = 100.0
 CANOPY_HEIGHT = 8.0
 CANOPY_SPAN = (16.0, 22.0)  # m from the origin, both axes
 STRAY_Z = 180.0  # the isolated return; a DSM that includes it tops out here
+# A square at the origin with no returns, so the CHM has nodata cells; returns
+# remain along both axes, so the grid's extent does not change.
+GAP = 6.0
 RESOLUTION = "1.0"  # contract v1 sends every value as a string
 TOLERANCE = 1e-3
+NODATA = np.float32(-9999.0)
+PREVIEW_MAX_SIDE = 1024
 
 GROUND_CLASS, HIGH_VEGETATION, HIGH_NOISE = 2, 5, 18
 DTYPE = [
@@ -66,7 +72,7 @@ def _returns(xy: np.ndarray, z: float, cls: int) -> np.ndarray:
 
 def cloud(classified: bool) -> np.ndarray:
     axis = np.arange(0.0, GROUND_SIZE, SPACING)
-    ground_xy = np.array([(x, y) for x in axis for y in axis])
+    ground_xy = np.array([(x, y) for x in axis for y in axis if x >= GAP or y >= GAP])
     # Canopy returns sit between the ground returns so no two share an XY.
     span = np.arange(CANOPY_SPAN[0], CANOPY_SPAN[1], SPACING) + SPACING / 2
     canopy_xy = np.array([(x, y) for x in span for y in span])
@@ -151,7 +157,7 @@ def band(path: Path) -> tuple[np.ndarray, tuple, str]:
 
 
 def valid(values: np.ndarray) -> np.ndarray:
-    return values[values != np.float32(-9999.0)]
+    return values[values != NODATA]
 
 
 def check_success(name: str, case: Path, noise_source: str, smrf: dict | str) -> None:
@@ -163,7 +169,7 @@ def check_success(name: str, case: Path, noise_source: str, smrf: dict | str) ->
     if manifest.get("contract_version") != 1:
         fail(f"{name}: contract_version is {manifest.get('contract_version')!r}")
     roles = {entry["role"]: entry for entry in manifest["outputs"]}
-    if set(roles) != {"dtm", "dsm", "chm", "report"}:
+    if set(roles) != {"dtm", "dsm", "chm", "preview", "report"}:
         fail(f"{name}: manifest roles are {sorted(roles)}")
     for entry in manifest["outputs"]:
         if hashlib.sha256((out / entry["path"]).read_bytes()).hexdigest() != entry["sha256"]:
@@ -194,10 +200,40 @@ def check_success(name: str, case: Path, noise_source: str, smrf: dict | str) ->
             fail(f"{name}: report smrf is {reported!r}, expected {smrf!r}")
     elif {key: reported.get(key) for key in smrf} != smrf:
         fail(f"{name}: report smrf is {reported!r}, expected to include {smrf!r}")
+    check_preview(name, out, chm, roles["preview"], report["preview"])
     print(
         f"ok: {name} (DTM {GROUND_Z}, CHM max {valid(chm).max():.3f}, "
         f"noise {report['noise_left_out']} via {report['noise_source']})"
     )
+
+
+def check_preview(name: str, out: Path, chm: np.ndarray, listed: dict, reported: dict) -> None:
+    if listed["path"] != "chm_preview.png" or listed.get("format") != "PNG":
+        fail(f"{name}: manifest lists the preview as {listed!r}")
+    preview = gdal.Open(str(out / "chm_preview.png"))
+    bands = [preview.GetRasterBand(index + 1) for index in range(preview.RasterCount)]
+    if preview.GetDriver().ShortName != "PNG" or len(bands) != 4:
+        fail(f"{name}: preview is {preview.GetDriver().ShortName} with {len(bands)} bands")
+    if any(b.DataType != gdal.GDT_Byte for b in bands):
+        fail(f"{name}: preview bands are not 8-bit")
+    size = (preview.RasterXSize, preview.RasterYSize)
+    if max(size) > PREVIEW_MAX_SIDE:
+        fail(f"{name}: preview is {size}, longer than {PREVIEW_MAX_SIDE} px")
+    # This grid is smaller than the limit, so the preview is the CHM cell for cell.
+    if size != chm.shape[::-1]:
+        fail(f"{name}: preview is {size}, the CHM {chm.shape[::-1]}")
+    nodata = chm == NODATA
+    alpha = bands[3].ReadAsArray()
+    if not nodata.any() or not np.array_equal(alpha, np.where(nodata, 0, 255)):
+        fail(f"{name}: preview alpha is not 0 over the CHM's nodata and 255 elsewhere")
+    recorded = [reported[key] for key in ("file", "width_px", "height_px", "downsampling_factor")]
+    if recorded != ["chm_preview.png", *size, 1.0]:
+        fail(f"{name}: report preview is {reported!r}")
+    # The canopy covers more than 1% of the valid cells, so the 99th percentile
+    # is its height.
+    stretch = (reported["colormap"], reported["stretch_low_m"], reported["stretch_high_m"])
+    if stretch[:2] != ("viridis", 0.0) or abs(stretch[2] - CANOPY_HEIGHT) > TOLERANCE:
+        fail(f"{name}: report preview stretch is {stretch}, expected viridis 0-{CANOPY_HEIGHT} m")
 
 
 def check_refused(name: str, case: Path, expected: str) -> None:
