@@ -14,6 +14,12 @@ GDAL 3.9.3) give exact values: slope atan(grade), aspect 270 (the plane faces
 west), roughness 2 * step (highest minus lowest cell in the window), TRI
 sqrt(6) * step (Riley: root of the summed squared differences from the
 center), and TPI 0 (center minus the mean of its neighbors).
+
+The hillshade preview is checked against the hillshade itself: each preview
+pixel is the mean of the valid cells under it, and transparent where there are
+none. A washboard wider than the preview's cap is shrunk by exactly 2; its
+ridges make neighboring hillshade columns differ, so a mean is told apart from
+picking one cell.
 """
 
 from __future__ import annotations
@@ -46,11 +52,21 @@ HILLSHADE_NODATA = 0
 INPUT_NODATA = -32768.0
 TOLERANCE = 1e-3
 RASTER_ROLES = {"slope", "aspect", "hillshade", "roughness", "tri", "tpi"}
+PREVIEW_FILE = "hillshade_preview.png"
+PREVIEW_MAX_SIDE = 1024  # px, as the entrypoint caps it
+WIDE = (600, 2 * PREVIEW_MAX_SIDE)  # rows, columns: a preview shrunk by exactly 2
 
 
 def plane(size: int = SIZE, cell: float = CELL) -> np.ndarray:
     x_centers = (np.arange(size) + 0.5) * cell
     return np.tile(BASE + GRADE * x_centers, (size, 1)).astype(np.float32)
+
+
+def washboard(rows: int, cols: int) -> np.ndarray:
+    # Ridges running north-south every four cells: by column, flat, facing west,
+    # flat, facing east, so no two neighboring hillshade columns are alike.
+    profile = BASE + STEP * np.resize([0.0, 1.0, 2.0, 1.0], cols)
+    return np.tile(profile, (rows, 1)).astype(np.float32)
 
 
 def write_dem(
@@ -87,6 +103,9 @@ def make_case(root: Path, name: str, values: np.ndarray, params: dict, **grid) -
 def make_fixtures(root: Path) -> dict[str, Path]:
     holed = plane()
     holed[20, 20] = INPUT_NODATA
+    # Large enough that some preview pixels hold only nodata and some hold both.
+    ridged = washboard(*WIDE)
+    ridged[100:110, 201:211] = INPUT_NODATA
     return {
         "plane": make_case(root, "plane", plane(), {"contour_interval": "1"}),
         "percent_zt": make_case(
@@ -97,6 +116,7 @@ def make_fixtures(root: Path) -> dict[str, Path]:
         ),
         "flat": make_case(root, "flat", np.full((SIZE, SIZE), BASE, np.float32), {}),
         "hole": make_case(root, "hole", holed, {}, nodata=INPUT_NODATA),
+        "wide": make_case(root, "wide", ridged, {}, nodata=INPUT_NODATA),
         # 0.5 m cells whose corner sits a quarter meter off the 1 m lattice.
         "resampled": make_case(
             root,
@@ -184,8 +204,53 @@ def expect_border_nodata(name: str, out: Path) -> None:
             fail(f"{name}: {role} has data on its outer ring")
 
 
+def block_sums(values: np.ndarray, factor: int) -> np.ndarray:
+    rows, cols = values.shape
+    return values.reshape(rows // factor, factor, cols // factor, factor).sum(axis=(1, 3))
+
+
+def expect_preview(name: str, out: Path, report: dict, factor: int) -> None:
+    """The preview against the hillshade, shrunk by a whole factor."""
+    manifest = json.loads((out / "run.json").read_text())
+    listed = [entry for entry in manifest["outputs"] if entry["path"] == PREVIEW_FILE]
+    if [(entry["role"], entry.get("format")) for entry in listed] != [("preview", "PNG")]:
+        fail(f"{name}: run.json lists the preview as {listed}")
+    dataset = gdal.Open(str(out / PREVIEW_FILE))
+    types = [dataset.GetRasterBand(i).DataType for i in range(1, dataset.RasterCount + 1)]
+    if dataset.GetDriver().ShortName != "PNG" or types != [gdal.GDT_Byte] * 4:
+        fail(f"{name}: the preview is not a 4-band 8-bit PNG")
+    if max(dataset.RasterXSize, dataset.RasterYSize) > PREVIEW_MAX_SIDE:
+        fail(f"{name}: the preview is {dataset.RasterXSize} x {dataset.RasterYSize} px")
+    red, green, blue, alpha = dataset.ReadAsArray()
+
+    shade, _, _ = read(out / "hillshade.tif")
+    valid = shade != HILLSHADE_NODATA
+    counts = block_sums(valid.astype(np.int64), factor)
+    means = block_sums(np.where(valid, shade, 0).astype(np.float64), factor) / np.maximum(counts, 1)
+    shown = counts > 0
+    if red.shape != counts.shape:
+        fail(f"{name}: the preview is {red.shape[::-1]} px, expected {counts.shape[::-1]}")
+    if shown.all():
+        fail(f"{name}: no preview pixel covers only nodata, so transparency goes unchecked")
+    if not ((red == green) & (green == blue)).all():
+        fail(f"{name}: the preview is not gray")
+    if not (alpha == np.where(shown, 255, 0)).all():
+        fail(f"{name}: the preview is not transparent exactly where the hillshade has no data")
+    # Half a level for GDAL's rounding to an 8-bit value.
+    if np.abs(red[shown] - means[shown]).max() > 0.5 + TOLERANCE:
+        fail(f"{name}: the preview is not the mean of the valid hillshade cells under each pixel")
+    expected = {
+        "file": PREVIEW_FILE,
+        "width_px": counts.shape[1],
+        "height_px": counts.shape[0],
+        "downsampling_factor": float(factor),
+    }
+    if report["preview"] != expected:
+        fail(f"{name}: report says the preview is {report['preview']}, expected {expected}")
+
+
 def check_plane(case: Path) -> None:
-    out, report = run_ok("plane", case, RASTER_ROLES | {"contours", "report"})
+    out, report = run_ok("plane", case, RASTER_ROLES | {"preview", "contours", "report"})
     expect_close(
         "plane",
         "slope (degrees)",
@@ -204,6 +269,7 @@ def check_plane(case: Path) -> None:
     if f'"EPSG","{EPSG}"' not in srs.replace(" ", ""):
         fail(f"plane: output CRS is not EPSG:{EPSG}")
     expect_border_nodata("plane", out)
+    expect_preview("plane", out, report, factor=1)
 
     elevations = plane()
     levels = set(range(math.ceil(elevations.min()), math.floor(elevations.max()) + 1))
@@ -223,7 +289,7 @@ def check_plane(case: Path) -> None:
 
 
 def check_percent_zt(case: Path) -> None:
-    out, report = run_ok("percent_zt", case, RASTER_ROLES | {"report"})
+    out, report = run_ok("percent_zt", case, RASTER_ROLES | {"preview", "report"})
     expect_close("percent_zt", "slope (percent)", interior(read(out / "slope.tif")[0]), 100 * GRADE)
     expect_close("percent_zt", "aspect", interior(read(out / "aspect.tif")[0]), 270.0)
     if report["methods"]["gradient"] != "ZevenbergenThorne" or report["contours"] != "not written":
@@ -232,7 +298,7 @@ def check_percent_zt(case: Path) -> None:
 
 
 def check_flat(case: Path) -> None:
-    out, _ = run_ok("flat", case, RASTER_ROLES | {"report"})
+    out, _ = run_ok("flat", case, RASTER_ROLES | {"preview", "report"})
     expect_close("flat", "slope", interior(read(out / "slope.tif")[0]), 0.0)
     expect_close("flat", "aspect", interior(read(out / "aspect.tif")[0]), FLOAT_NODATA)
     expect_close("flat", "roughness", interior(read(out / "roughness.tif")[0]), 0.0)
@@ -241,17 +307,24 @@ def check_flat(case: Path) -> None:
 
 
 def check_hole(case: Path) -> None:
-    out, _ = run_ok("hole", case, RASTER_ROLES | {"report"})
+    out, report = run_ok("hole", case, RASTER_ROLES | {"preview", "report"})
     for role in RASTER_ROLES:
         values, _, _ = read(out / f"{role}.tif")
         nodata = HILLSHADE_NODATA if role == "hillshade" else FLOAT_NODATA
         if not (values[19:22, 19:22] == values.dtype.type(nodata)).all():
             fail(f"hole: {role} has data in the 3 x 3 neighborhood of the nodata cell")
+    expect_preview("hole", out, report, factor=1)
     print("ok: hole (nodata spreads to its 3 x 3 neighborhood only)")
 
 
+def check_wide(case: Path) -> None:
+    out, report = run_ok("wide", case, RASTER_ROLES | {"preview", "report"})
+    expect_preview("wide", out, report, factor=2)
+    print(f"ok: wide (preview averaged 2 x 2 to {WIDE[1] // 2} x {WIDE[0] // 2} px)")
+
+
 def check_resampled(case: Path) -> None:
-    out, report = run_ok("resampled", case, RASTER_ROLES | {"report"})
+    out, report = run_ok("resampled", case, RASTER_ROLES | {"preview", "report"})
     _, transform, _ = read(out / "slope.tif")
     if abs(transform[1] - CELL) > TOLERANCE or abs(-transform[5] - CELL) > TOLERANCE:
         fail(f"resampled: output cell size is {transform[1]} x {-transform[5]}")
@@ -288,6 +361,7 @@ def main() -> int:
         check_percent_zt(cases["percent_zt"])
         check_flat(cases["flat"])
         check_hole(cases["hole"])
+        check_wide(cases["wide"])
         check_resampled(cases["resampled"])
         check_refused("geographic", cases["geographic"], "reproject")
         check_refused("rotated", cases["rotated"], "rotated grid")
