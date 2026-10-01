@@ -201,9 +201,11 @@ under `<input-dir>/primary/`; parameters in `params.json`: `resolution`,
 **Products.**
 - `slope.tif`, `aspect.tif`, `hillshade.tif`, `roughness.tif`, `tri.tif`,
   `tpi.tif` → gdaldem products on the input grid (or the resampled one)
+- `hillshade_preview.png` → the hillshade as a gray RGBA PNG for display in
+  chat, at most 1024 pixels on its longer side, nodata transparent
 - `contours.gpkg` → contour lines, only when `contour_interval` is above zero
 - `terrain_report.json` → grids, parameters used, each raster's range and
-  nodata count, contour count and range, GDAL version
+  nodata count, the preview's size, contour count and range, GDAL version
 - `run.json` → the contract manifest
 
 **Run.** `terrain-derivatives --input-dir <dir> --output-dir <dir>
@@ -220,7 +222,7 @@ under `<input-dir>/primary/`; parameters in `params.json`: `resolution`,
   one-cell border.
 - Curvature is not computed yet.
 
-**Lab status.** Active (v1 in progress). Atlas's third course pipeline.
+**Lab status.** Active (v2 in progress). Atlas's third course pipeline.
 
 ---
 

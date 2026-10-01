@@ -32,11 +32,11 @@ ENV PATH=/opt/conda/bin:$PATH \
 
 COPY bin/terrain-derivatives /usr/local/bin/terrain-derivatives
 
-# Offline build check: the bindings import, the COG and GeoPackage drivers are
-# present, gdal_contour sits where the entrypoint calls it, and the entrypoint
-# parses even with an empty environment. No network, no data.
+# Offline build check: the bindings import, the COG, PNG and GeoPackage drivers
+# are present, gdal_contour sits where the entrypoint calls it, and the
+# entrypoint parses even with an empty environment. No network, no data.
 RUN chmod +x /usr/local/bin/terrain-derivatives \
-    && python -c "from osgeo import gdal, ogr; import numpy; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'; assert ogr.GetDriverByName('GPKG') is not None, 'GPKG driver missing'" \
+    && python -c "from osgeo import gdal, ogr; import numpy; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'; assert gdal.GetDriverByName('PNG') is not None, 'PNG driver missing'; assert ogr.GetDriverByName('GPKG') is not None, 'GPKG driver missing'" \
     && test -x /opt/conda/bin/gdal_contour \
     && gdalinfo --version \
     && env -i /usr/local/bin/terrain-derivatives --help >/dev/null \
@@ -46,5 +46,5 @@ WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/terrain-derivatives"]
 
 LABEL org.opencontainers.image.source="https://github.com/bradleylab/geo-pipelines"
-LABEL org.opencontainers.image.description="Slope, aspect, hillshade, roughness, TRI, TPI and contours from one elevation model (entrypoint contract v1)"
+LABEL org.opencontainers.image.description="Slope, aspect, hillshade with a PNG preview, roughness, TRI, TPI and contours from one elevation model (entrypoint contract v1)"
 LABEL org.opencontainers.image.licenses="Apache-2.0"

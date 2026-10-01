@@ -11,7 +11,8 @@ Slope, aspect, hillshade, roughness, the terrain ruggedness index (TRI) and the
 topographic position index (TPI) come from gdaldem's library form
 (``gdal.DEMProcessing``) on one grid, and contour lines from gdal_contour when
 an interval is given. An optional cell size averages the model onto a coarser
-grid first.
+grid first. A small PNG of the hillshade, with its nodata transparent, lets a
+chat client show the result inline.
 """
 
 from __future__ import annotations
@@ -69,11 +70,12 @@ STAGING_OPTIONS = ["TILED=YES", "BIGTIFF=IF_SAFER"]
 # resampled model gets where no input cell contributes.
 RESAMPLED_NODATA = -9999.0
 
+HILLSHADE_FILE = "hillshade.tif"
 # (file, role, gdaldem processing mode)
 RASTERS = (
     ("slope.tif", "slope", "slope"),
     ("aspect.tif", "aspect", "aspect"),
-    ("hillshade.tif", "hillshade", "hillshade"),
+    (HILLSHADE_FILE, "hillshade", "hillshade"),
     ("roughness.tif", "roughness", "Roughness"),
     ("tri.tif", "tri", "TRI"),
     ("tpi.tif", "tpi", "TPI"),
@@ -81,6 +83,8 @@ RASTERS = (
 CONTOURS_FILE, CONTOURS_ROLE = "contours.gpkg", "contours"
 CONTOUR_LAYER, CONTOUR_FIELD = "contour", "elevation_m"
 REPORT_FILE, REPORT_ROLE = "terrain_report.json", "report"
+PREVIEW_FILE, PREVIEW_ROLE = "hillshade_preview.png", "preview"
+PREVIEW_MAX_SIDE = 1024  # px; small enough for a chat client to show inline
 
 ELEVATION_UNITS = (
     "elevations are taken to be in meters; a model with elevations in feet gives slopes "
@@ -271,6 +275,32 @@ def raster_summary(path: Path) -> dict[str, Any]:
     }
 
 
+def write_preview(hillshade: Path, target: Path) -> dict[str, Any]:
+    """The hillshade as gray RGBA for display, shrunk to fit the preview size and never enlarged."""
+    source = gdal.Open(str(hillshade))
+    factor = max(1.0, max(source.RasterXSize, source.RasterYSize) / PREVIEW_MAX_SIDE)
+    width = max(1, round(source.RasterXSize / factor))
+    height = max(1, round(source.RasterYSize / factor))
+    # The average skips nodata cells, so a preview pixel is nodata only where
+    # every hillshade cell under it is.
+    shrunk = gdal.Translate(
+        "", source, format="MEM", width=width, height=height, resampleAlg="average"
+    )
+    band = shrunk.GetRasterBand(1)
+    shade = band.ReadAsArray()
+    alpha = np.where(shade == band.GetNoDataValue(), 0, 255).astype(np.uint8)
+    rgba = gdal.GetDriverByName("MEM").Create("", width, height, 4, gdal.GDT_Byte)
+    for index, values in enumerate((shade, shade, shade, alpha), start=1):
+        rgba.GetRasterBand(index).WriteArray(values)
+    gdal.GetDriverByName("PNG").CreateCopy(str(target), rgba)
+    return {
+        "file": target.name,
+        "width_px": width,
+        "height_px": height,
+        "downsampling_factor": factor,
+    }
+
+
 def write_contours(model: Path, target: Path, interval: float) -> dict[str, Any]:
     # Called by absolute path: a job step on Compute2 carries the host's PATH,
     # not the image's, and gdal_contour sits beside this interpreter.
@@ -339,6 +369,11 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
             summaries[role] = raster_summary(output_dir / name)
             outputs.append((name, role))
 
+        # From the staging hillshade, not the COG: shrinking the COG would read
+        # its overviews rather than average every cell.
+        preview = write_preview(work / HILLSHADE_FILE, output_dir / PREVIEW_FILE)
+        outputs.append((PREVIEW_FILE, PREVIEW_ROLE))
+
         contours: dict[str, Any] | str = "not written"
         if params.contour_interval != NO_CONTOURS:
             contours = write_contours(model, output_dir / CONTOURS_FILE, params.contour_interval)
@@ -364,6 +399,7 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
             "edges": "nodata wherever a 3 x 3 window holds a nodata cell, and on the outer ring",
         },
         "rasters": summaries,
+        "preview": preview,
         "contours": contours,
         "elevation_units": ELEVATION_UNITS,
         "versions": {"gdal": gdal.__version__},
@@ -372,7 +408,7 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
     outputs.append((REPORT_FILE, REPORT_ROLE))
 
     # The manifest goes last: its presence is what says the run finished.
-    formats = {".tif": "GTiff", ".gpkg": "GPKG"}
+    formats = {".tif": "GTiff", ".gpkg": "GPKG", ".png": "PNG"}
     manifest = {
         "contract_version": CONTRACT_VERSION,
         "outputs": [
