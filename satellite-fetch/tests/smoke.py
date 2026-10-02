@@ -5,19 +5,25 @@ The recipe's network half (the catalog search and the reads) needs Planetary
 Computer and is exercised by the fixture run on Compute2. This test covers the
 rest with synthetic inputs whose answers are known: parameter checks, the output
 grid, the clear-sky rules for each quality layer, the Sentinel-2 offset, how
-items of one pass are merged, and the COG written. ``--fixtures-only DIR`` writes
-a site too large to fetch for, so CI can run the image's real ENTRYPOINT and see
+items of one pass are merged, and the COG written. It then runs the whole recipe
+for each product with the search and the reads replaced by synthetic layers, and
+checks the false-color preview of the optical products against the imagery.tif
+written beside it, and that radar gets none. ``--fixtures-only DIR`` writes a
+site too large to fetch for, so CI can run the image's real ENTRYPOINT and see
 it refuse before any network call.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import sys
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 
@@ -34,6 +40,25 @@ EPSG = 32615  # UTM 15N: the St. Louis sites
 ORIGIN = (736000.0, 4276000.0)  # top-left corner
 SITE_SIDE_M = 2000.0
 TOO_LARGE_SIDE_M = 30_000.0
+
+NODATA = -9999  # imagery.tif's reflectance nodata
+PREVIEW_FILE = "imagery_preview.png"
+PREVIEW_MAX_SIDE = 1024  # px, as the entrypoint caps it
+PERCENTILES = (2, 98)
+REFLECTANCE_SCALE = 10_000
+CHANNELS = ("red", "green", "blue")
+
+# Cells of the synthetic optical scenes, as (rows, columns); all fit the
+# smallest grid, HLS's 30 m over a 2 km site.
+CORNER = (slice(0, 5), slice(0, 5))  # no band holds data
+# One patch per composite band, in red, green, blue order: high in that band.
+PATCHES = (
+    (slice(10, 18), slice(10, 18)),
+    (slice(10, 18), slice(30, 38)),
+    (slice(10, 18), slice(50, 58)),
+)
+FIRST_MISSING = (40, slice(30, 40))  # only the band shown as red is nodata
+OTHER_MISSING = (45, slice(30, 40))  # only a band outside the composite is nodata
 
 
 def load_program() -> ModuleType:
@@ -193,6 +218,268 @@ def test_cog(program: ModuleType, work: Path) -> None:
     check((band.GetDescription(), band.GetNoDataValue()) == ("b", -9999), "band names and nodata")
 
 
+def test_preview_shrinks(program: ModuleType, work: Path) -> None:
+    """A grid twice the preview's cap, checkered so a mean is told apart from one cell."""
+    product = program.PRODUCTS["hls"]
+    rows, cols = 40, 2 * PREVIEW_MAX_SIDE
+    checkered = np.where(np.indices((rows, cols)).sum(axis=0) % 2 == 1, 3000, 1000)
+    stack = np.full((len(product.band_names), rows, cols), 1500, dtype=np.int16)
+    composite = [product.band_names.index(name) for name in ("swir2", "nir_narrow", "red")]
+    stack[composite] = checkered
+    stack[:, 0:2, 0:2] = NODATA  # a 2 x 2 block with no data at all
+    stack[composite[0], 0, 2] = NODATA  # and one with a cell missing a composite band
+    reported = program.write_preview(stack, product, work / PREVIEW_FILE)
+
+    preview = gdal.Open(str(work / PREVIEW_FILE)).ReadAsArray().astype(np.float64)
+    valid = (stack[composite] != NODATA).all(axis=0)
+    blocks = (rows // 2, 2, cols // 2, 2)
+    counts = valid.reshape(blocks).sum(axis=(1, 3))
+    shown = counts > 0
+    check(
+        preview.shape == (4, rows // 2, cols // 2),
+        f"a {cols} x {rows} grid is averaged 2 x 2 to {cols // 2} x {rows // 2} px",
+    )
+    check(
+        np.array_equal(preview[3], np.where(shown, 255, 0)),
+        "a pixel is transparent only where every cell under it lacks a composite band",
+    )
+    for index, band in enumerate(composite):
+        sums = np.where(valid, stack[band], 0).astype(np.float64).reshape(blocks).sum(axis=(1, 3))
+        expected = np.clip((sums / np.maximum(counts, 1) - 1000.0) / 2000.0, 0.0, 1.0) * 255.0
+        # One level for rounding to 8 bits.
+        check(
+            np.abs(preview[index] - expected)[shown].max() <= 1.0,
+            f"{CHANNELS[index]}: each pixel the mean of the valid cells under it, stretched",
+        )
+    # The checkers' 2nd and 98th percentiles are 1000 and 3000, but every 2 x 2
+    # mean but one is 2000, so a stretch taken from the means would be empty.
+    stretch = reported["stretch_reflectance"].values()
+    check(
+        reported["downsampling_factor"] == 2.0
+        and (reported["width_px"], reported["height_px"]) == (cols // 2, rows // 2)
+        and all(np.allclose([s["low"], s["high"]], [0.1, 0.3]) for s in stretch),
+        "the report's stretch comes from the full-resolution cells, 0.1 to 0.3",
+    )
+
+
+class _Asset:
+    def __init__(self, href: str) -> None:
+        self.href = href
+
+
+class _Scene:
+    """The parts of a STAC item the recipe reads, for one synthetic acquisition."""
+
+    def __init__(self, collection: str, keys: list[str], properties: dict) -> None:
+        self.id = f"{collection}-synthetic"
+        self.collection_id = collection
+        self.datetime = datetime(2025, 6, 1, 16, 30, tzinfo=timezone.utc)
+        self.properties = {"platform": "synthetic", **properties}
+        self.assets = {key: _Asset(f"synthetic://{collection}/{key}") for key in keys}
+
+
+@dataclass(frozen=True)
+class Optical:
+    """How one optical product's assets hold a scene, and the preview it should get."""
+
+    product: str
+    composite: tuple[str, str, str]  # the bands expected as red, green and blue
+    other: str  # a band outside the composite
+    dtype: type
+    offset: int  # what the catalog adds to every value
+    fill: int  # the assets' own nodata
+    quality: tuple[str, int, int]  # the quality asset, a clear value, its fill
+    properties: dict
+
+
+OPTICAL = (
+    Optical(
+        product="hls",
+        composite=("swir2", "nir_narrow", "red"),
+        other="blue",
+        dtype=np.int16,
+        offset=0,
+        fill=NODATA,
+        quality=("Fmask", 0, 255),
+        properties={},
+    ),
+    # A baseline from 04.00 on, so the catalog's values carry ESA's offset of 1000.
+    Optical(
+        product="sentinel2_l2a",
+        composite=("B12", "B8A", "B04"),
+        other="B01",
+        dtype=np.int32,
+        offset=1000,
+        fill=0,
+        quality=("SCL", 4, 0),
+        properties={"s2:processing_baseline": "05.11"},
+    ),
+)
+
+
+def staged_site(program: ModuleType, work: Path, product: str) -> tuple[Path, object]:
+    case = work / product
+    site = case / "input" / "primary" / "site.tif"
+    write_site(site, SITE_SIDE_M)
+    return case, program.site_grid(site, program.PRODUCTS[product].resolution)
+
+
+def run_offline(
+    program: ModuleType, case: Path, product: str, layers: dict, properties: dict
+) -> tuple[Path, dict, dict]:
+    """The real run(), with the catalog search and every asset read replaced by ``layers``."""
+    collection = next(iter(program.PRODUCTS[product].collections))
+    scene = _Scene(collection, list(layers), properties)
+    saved = program.search, program.warp
+    program.search = lambda *_: [scene]
+    program.warp = lambda href, *_: layers[href.rsplit("/", 1)[1]].copy()
+    try:
+        program.run(case / "input", case / "output", program.Params(product, 2025, 1, 12))
+    finally:
+        program.search, program.warp = saved
+    out = case / "output"
+    manifest = json.loads((out / "run.json").read_text())
+    return out, manifest, json.loads((out / "fetch_report.json").read_text())
+
+
+def optical_layers(program: ModuleType, spec: Optical, grid) -> dict[str, np.ndarray]:
+    """Per asset, a scene in which each band of the composite has a patch of its own.
+
+    Outside the patches the three bands share one gentle west-to-east ramp; in a
+    band's own patch it is far above the ramp and the other two far below it, so
+    the patch should come out in that band's color alone.
+    """
+    product = program.PRODUCTS[spec.product]
+    shape = (grid.height, grid.width)
+    east = np.broadcast_to(np.linspace(0.0, 200.0, grid.width), shape)
+    values = {name: np.full(shape, 1500.0) for name in product.band_names}
+    for name in spec.composite:
+        values[name] = 1000.0 + east
+    for own, patch in zip(spec.composite, PATCHES, strict=True):
+        for name in spec.composite:
+            values[name][patch] = 3000.0 if name == own else 500.0
+    stored = {name: (np.rint(v) + spec.offset).astype(spec.dtype) for name, v in values.items()}
+    for layer in stored.values():
+        layer[CORNER] = spec.fill
+    stored[spec.composite[0]][FIRST_MISSING] = spec.fill
+    stored[spec.other][OTHER_MISSING] = spec.fill
+
+    key, clear, fill = spec.quality
+    quality = np.full(shape, clear, dtype=np.uint8)
+    quality[CORNER] = fill
+    assets = dict(zip(product.band_names, next(iter(product.collections.values())), strict=True))
+    return {assets[name]: layer for name, layer in stored.items()} | {key: quality}
+
+
+def check_preview(out: Path, manifest: dict, report: dict, spec: Optical) -> None:
+    """The preview against the imagery.tif written beside it."""
+    name = spec.product
+    listed = [entry for entry in manifest["outputs"] if entry["path"] == PREVIEW_FILE]
+    digest = hashlib.sha256((out / PREVIEW_FILE).read_bytes()).hexdigest()
+    check(
+        [(e["role"], e.get("format"), e["sha256"]) for e in listed] == [("preview", "PNG", digest)],
+        f"{name}: run.json lists the preview with role preview, format PNG and its checksum",
+    )
+    preview = gdal.Open(str(out / PREVIEW_FILE))
+    types = [preview.GetRasterBand(i).DataType for i in range(1, preview.RasterCount + 1)]
+    check(
+        preview.GetDriver().ShortName == "PNG" and types == [gdal.GDT_Byte] * 4,
+        f"{name}: the preview is a 4-band 8-bit PNG",
+    )
+    imagery = gdal.Open(str(out / "imagery.tif"))
+    named = {
+        imagery.GetRasterBand(i).GetDescription(): imagery.GetRasterBand(i).ReadAsArray()
+        for i in range(1, imagery.RasterCount + 1)
+    }
+    size = (preview.RasterXSize, preview.RasterYSize)
+    # The grid is far under the cap, so the preview is imagery.tif cell for cell.
+    check(
+        size == (imagery.RasterXSize, imagery.RasterYSize) and max(size) <= PREVIEW_MAX_SIDE,
+        f"{name}: {size[0]} x {size[1]} px, imagery.tif cell for cell and not enlarged",
+    )
+
+    bands = np.stack([named[band] for band in spec.composite]).astype(np.float64)
+    valid = (bands != NODATA).all(axis=0)
+    rgba = preview.ReadAsArray().astype(np.float64)
+    check(
+        np.array_equal(rgba[3], np.where(valid, 255, 0)) and not valid[FIRST_MISSING].any(),
+        f"{name}: transparent exactly where any of {', '.join(spec.composite)} is nodata",
+    )
+    check(
+        (named[spec.other][OTHER_MISSING] == NODATA).all()
+        and (rgba[3][OTHER_MISSING] == 255).all(),
+        f"{name}: a cell missing only {spec.other}, outside the composite, stays opaque",
+    )
+    limits = np.percentile(bands[:, valid], PERCENTILES, axis=1).T
+    for index, (band, (low, high)) in enumerate(zip(spec.composite, limits, strict=True)):
+        expected = np.clip((bands[index] - low) / (high - low), 0.0, 1.0) * 255.0
+        # One level for rounding to 8 bits.
+        check(
+            np.abs(rgba[index] - expected)[valid].max() <= 1.0,
+            f"{name}: {CHANNELS[index]} is {band} stretched from its 2nd to its 98th percentile",
+        )
+    for index, patch in enumerate(PATCHES):
+        excess = rgba[index] - np.delete(rgba[:3], index, axis=0).max(axis=0)
+        inside = np.zeros(valid.shape, dtype=bool)
+        inside[patch] = True
+        check(
+            excess[inside].min() > excess[valid & ~inside].max(),
+            f"{name}: the patch high in {spec.composite[index]} is the most {CHANNELS[index]}",
+        )
+
+    reported = report["preview"]
+    expected_block = {
+        "file": PREVIEW_FILE,
+        "width_px": size[0],
+        "height_px": size[1],
+        "downsampling_factor": 1.0,
+        "composite": list(spec.composite),
+        "stretch_percentiles": list(PERCENTILES),
+    }
+    stretch = reported["stretch_reflectance"]
+    check(
+        {key: reported[key] for key in expected_block} == expected_block
+        and list(stretch) == list(spec.composite)
+        and np.allclose(
+            [[stretch[band]["low"], stretch[band]["high"]] for band in spec.composite],
+            limits / REFLECTANCE_SCALE,
+        ),
+        f"{name}: the report gives the preview's size, composite and stretch in reflectance",
+    )
+
+
+def test_optical_runs(program: ModuleType, work: Path) -> None:
+    for spec in OPTICAL:
+        case, grid = staged_site(program, work, spec.product)
+        layers = optical_layers(program, spec, grid)
+        out, manifest, report = run_offline(program, case, spec.product, layers, spec.properties)
+        roles = sorted(entry["role"] for entry in manifest["outputs"])
+        check(
+            roles == ["imagery", "preview", "quality", "report"],
+            f"{spec.product}: run.json lists imagery, preview, quality and report",
+        )
+        check_preview(out, manifest, report, spec)
+
+
+def test_radar_run(program: ModuleType, work: Path) -> None:
+    case, grid = staged_site(program, work, "sentinel1_rtc")
+    layers = {
+        key: np.full((grid.height, grid.width), 0.1, dtype=np.float32) for key in ("vv", "vh")
+    }
+    for layer in layers.values():
+        layer[CORNER] = np.nan
+    out, manifest, report = run_offline(program, case, "sentinel1_rtc", layers, {})
+    check(not (out / PREVIEW_FILE).exists(), "sentinel1_rtc: no preview is written")
+    check(
+        sorted(entry["role"] for entry in manifest["outputs"]) == ["imagery", "report"],
+        "sentinel1_rtc: run.json lists imagery and report, and no preview",
+    )
+    check(
+        "preview" in report and report["preview"] is None,
+        "sentinel1_rtc: the report's preview is null",
+    )
+
+
 def write_fixtures(root: Path) -> None:
     write_site(root / "cases" / "too_large" / "input" / "primary" / "site.tif", TOO_LARGE_SIDE_M)
     (root / "cases" / "too_large" / "params.json").write_text(json.dumps({"year": "2025"}))
@@ -213,6 +500,9 @@ def main() -> int:
         test_clear_rules(program)
         test_offset_and_merge(program)
         test_cog(program, work)
+        test_preview_shrinks(program, work)
+        test_optical_runs(program, work)
+        test_radar_run(program, work)
     print("satellite-fetch smoke test passed")
     return 0
 

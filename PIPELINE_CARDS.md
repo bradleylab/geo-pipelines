@@ -242,10 +242,14 @@ side. Parameters in `params.json`: `product`, `year` and `month_start` /
 - `imagery.tif` → the chosen scene's bands on a UTM grid over the site: HLS six
   bands at 30 m, Sentinel-2 twelve bands at 10 m with the baseline 04.00 offset
   removed, or Sentinel-1 VV and VH gamma-naught at 10 m
+- `imagery_preview.png` → HLS and Sentinel-2 only: SWIR 2, narrow NIR and red
+  as an RGBA PNG, each band stretched between its 2nd and 98th percentiles,
+  nodata transparent, averaged down to at most 1024 px on a side
 - `quality.tif` → the scene's `Fmask` or `SCL` on the same grid (not for
   Sentinel-1)
 - `fetch_report.json` → the chosen items and every candidate with its clear
-  share, the grid, the band table, versions
+  share, the grid, the band table, the preview's size, composite and stretch,
+  versions
 - `run.json` → the contract manifest
 
 **Run.** `satellite-fetch --input-dir <dir> --output-dir <dir> --params-json
@@ -263,7 +267,7 @@ side. Parameters in `params.json`: `product`, `year` and `month_start` /
 - A catalog can reprocess an item under the same id, so reruns are traced by id
   rather than checksum.
 
-**Lab status.** Active (v1 in progress). Supplies the remote-sensing models.
+**Lab status.** Active (v2 in progress). Supplies the remote-sensing models.
 
 ---
 

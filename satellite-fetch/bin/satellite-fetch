@@ -10,7 +10,9 @@ written under ``<output-dir>``. The design is
 The scenes come from Microsoft Planetary Computer's STAC API, read with an
 anonymous shared access signature. Items acquired on the same day by the same
 platform form one candidate scene; each candidate is scored by the share of the
-site its own quality layer calls clear, and the highest share wins.
+site its own quality layer calls clear, and the highest share wins. For the
+optical products a small false-color PNG of the scene comes with it, for a chat
+client to show inline.
 """
 
 from __future__ import annotations
@@ -69,6 +71,17 @@ EDGE_POINTS = 21
 IMAGERY_FILE, IMAGERY_ROLE = "imagery.tif", "imagery"
 QUALITY_FILE, QUALITY_ROLE = "quality.tif", "quality"
 REPORT_FILE, REPORT_ROLE = "fetch_report.json", "report"
+PREVIEW_FILE, PREVIEW_ROLE = "imagery_preview.png", "preview"
+
+# The preview: SWIR 2, narrow NIR and red as red, green and blue, a composite in
+# which burned ground and bare soil show reddish-brown and vegetation green.
+# Each band is stretched linearly between its own 2nd and 98th percentiles over
+# the cells where all three hold data; longest side at most 1024 px.
+PREVIEW_MAX_SIDE = 1024  # px; small enough for a chat client to show inline
+PREVIEW_PERCENTILES = (2, 98)
+# Both optical products hold reflectance x 10000 (README, "Bands and values");
+# the report gives the stretch in reflectance.
+REFLECTANCE_SCALE = 10_000
 
 
 HLS, SENTINEL2, SENTINEL1 = "hls", "sentinel2", "sentinel1"
@@ -86,6 +99,9 @@ class Product:
     nodata: float
     quality: str | None  # the quality asset, or None when the product has none
     quality_nodata: int | None
+    # Bands shown as red, green and blue in the preview; None writes no preview,
+    # as for radar, whose display needs choices of its own.
+    preview: tuple[str, str, str] | None
 
 
 PRODUCTS = {
@@ -101,6 +117,7 @@ PRODUCTS = {
         nodata=REFLECTANCE_NODATA,
         quality="Fmask",
         quality_nodata=FMASK_FILL,
+        preview=("swir2", "nir_narrow", "red"),
     ),
     "sentinel2_l2a": Product(
         kind=SENTINEL2,
@@ -139,6 +156,7 @@ PRODUCTS = {
         nodata=REFLECTANCE_NODATA,
         quality="SCL",
         quality_nodata=SCL_NODATA,
+        preview=("B12", "B8A", "B04"),
     ),
     "sentinel1_rtc": Product(
         kind=SENTINEL1,
@@ -149,6 +167,7 @@ PRODUCTS = {
         nodata=float("nan"),
         quality=None,
         quality_nodata=None,
+        preview=None,
     ),
 }
 
@@ -442,6 +461,75 @@ def write_cog(
     )
 
 
+def stretch(values: np.ndarray, low: float, high: float) -> np.ndarray:
+    """Values to 0-255: ``low`` and below to 0, ``high`` and above to 255, linear between."""
+    if high <= low:
+        # One value fills the band from the low to the high percentile, so
+        # there is no range to stretch over: a value above it is above the
+        # stretch, and the rest at or below it.
+        return np.where(values > high, 255, 0).astype(np.uint8)
+    scaled = (values - low) / (high - low) * 255.0
+    return np.rint(np.clip(scaled, 0.0, 255.0)).astype(np.uint8)
+
+
+def write_preview(stack: np.ndarray, product: Product, target: Path) -> dict[str, Any]:
+    """The scene as a false-color RGBA PNG, nodata transparent, averaged down but never enlarged."""
+    bands = np.stack([stack[product.band_names.index(name)] for name in product.preview])
+    valid = (bands != product.nodata).all(axis=0)
+    # Each band's stretch comes from its valid cells at full resolution, not
+    # from the averages below, which narrow its spread.
+    limits = [
+        tuple(float(v) for v in np.percentile(band[valid], PREVIEW_PERCENTILES))
+        if valid.any()
+        else (None, None)
+        for band in bands
+    ]
+
+    rows, cols = valid.shape
+    factor = max(1.0, max(rows, cols) / PREVIEW_MAX_SIDE)
+    width = max(1, round(cols / factor))
+    height = max(1, round(rows / factor))
+    staging = gdal.GetDriverByName("MEM").Create("", cols, rows, len(bands), gdal.GDT_Float32)
+    for index, values in enumerate(bands, start=1):
+        band = staging.GetRasterBand(index)
+        # A cell missing any of the three bands is left out of all three
+        # averages, so each pixel's three colors come from the same cells.
+        band.WriteArray(np.where(valid, values, product.nodata))
+        band.SetNoDataValue(product.nodata)
+    # GDAL's average leaves nodata cells out; a pixel is nodata only when every
+    # cell under it is.
+    shrunk = gdal.Translate(
+        "", staging, format="MEM", width=width, height=height, resampleAlg="average"
+    )
+    averaged = shrunk.ReadAsArray().astype(np.float64)
+    shown = (averaged != product.nodata).all(axis=0)
+
+    rgba = np.zeros((4, height, width), dtype=np.uint8)
+    if shown.any():
+        for index, (low, high) in enumerate(limits):
+            rgba[index] = np.where(shown, stretch(averaged[index], low, high), 0)
+    rgba[3] = np.where(shown, 255, 0)
+    image = gdal.GetDriverByName("MEM").Create("", width, height, 4, gdal.GDT_Byte)
+    for index in range(4):
+        image.GetRasterBand(index + 1).WriteArray(rgba[index])
+    gdal.GetDriverByName("PNG").CreateCopy(str(target), image)
+    return {
+        "file": target.name,
+        "width_px": width,
+        "height_px": height,
+        "downsampling_factor": factor,
+        "composite": list(product.preview),
+        "stretch_percentiles": list(PREVIEW_PERCENTILES),
+        "stretch_reflectance": {
+            name: {
+                "low": None if low is None else low / REFLECTANCE_SCALE,
+                "high": None if high is None else high / REFLECTANCE_SCALE,
+            }
+            for name, (low, high) in zip(product.preview, limits, strict=True)
+        },
+    }
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -489,15 +577,22 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: list[tuple[str, str]] = []
+    imagery = band_stack(product, items, grid)
     write_cog(
         output_dir / IMAGERY_FILE,
-        band_stack(product, items, grid),
+        imagery,
         grid,
         product.data_type,
         product.nodata,
         product.band_names,
     )
     outputs.append((IMAGERY_FILE, IMAGERY_ROLE))
+    preview = None
+    if product.preview is not None:
+        # From the bands the COG was written from: a shrunk read of the COG
+        # would come from its overviews rather than average every cell.
+        preview = write_preview(imagery, product, output_dir / PREVIEW_FILE)
+        outputs.append((PREVIEW_FILE, PREVIEW_ROLE))
     if product.quality is not None:
         quality = quality_of(product, items, grid)[np.newaxis]
         write_cog(
@@ -527,6 +622,7 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
             }
             for index, name in enumerate(product.band_names)
         ],
+        "preview": preview,
         "versions": {
             "gdal": gdal.__version__,
             **{package: im.version(package) for package in ("pystac-client", "planetary-computer")},
@@ -536,7 +632,7 @@ def run(input_dir: Path, output_dir: Path, params: Params) -> None:
     outputs.append((REPORT_FILE, REPORT_ROLE))
 
     # The manifest goes last: its presence is what says the run finished.
-    formats = {".tif": "GTiff"}
+    formats = {".tif": "GTiff", ".png": "PNG"}
     manifest = {
         "contract_version": CONTRACT_VERSION,
         "outputs": [

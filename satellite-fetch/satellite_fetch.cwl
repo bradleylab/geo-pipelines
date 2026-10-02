@@ -1,6 +1,6 @@
 #!/usr/bin/env cwl-runner
 # satellite_fetch, described as a CWL v1.2 CommandLineTool for the image
-# ghcr.io/bradleylab/satellite-fetch:v1, whose ENTRYPOINT takes --input-dir,
+# ghcr.io/bradleylab/satellite-fetch:v2, whose ENTRYPOINT takes --input-dir,
 # --output-dir and --params-json (the geospatial executor's entrypoint contract
 # v1). The staging layout and params.json are built from the typed inputs below,
 # so an engine that honors the image ENTRYPOINT runs it as the executor does.
@@ -15,8 +15,10 @@ doc: |
   on Microsoft Planetary Computer that its own quality layer calls clearest over
   the site in the chosen year and months, and writes it clipped to the site's
   bounding box in the UTM zone of its center, with that quality layer and a
-  report of every candidate scene. Sites longer than 25 km on a side are
-  refused. Needs outbound HTTPS to Planetary Computer.
+  report of every candidate scene. For HLS and Sentinel-2 it also writes a
+  false-color PNG preview (SWIR 2, narrow NIR and red as red, green and blue).
+  Sites longer than 25 km on a side are refused. Needs outbound HTTPS to
+  Planetary Computer.
 
 $namespaces:
   s: https://schema.org/
@@ -24,7 +26,7 @@ $namespaces:
 
 s:codeRepository: https://github.com/bradleylab/geo-pipelines
 s:license: Apache-2.0
-s:version: "1"
+s:version: "2"
 gx:model: satellite-fetch
 gx:capability: fetch_imagery
 gx:tags: [geoprocessing]
@@ -33,7 +35,7 @@ gx:contract: 1
 
 requirements:
   DockerRequirement:
-    dockerPull: ghcr.io/bradleylab/satellite-fetch:v1
+    dockerPull: ghcr.io/bradleylab/satellite-fetch:v2
   NetworkAccess:
     networkAccess: true
   InlineJavascriptRequirement: {}
@@ -107,6 +109,11 @@ outputs:
     type: File
     outputBinding: {glob: output/imagery.tif}
     gx:role: imagery
+  # Written for the optical products only; Sentinel-1 RTC gets no preview.
+  preview:
+    type: File?
+    outputBinding: {glob: output/imagery_preview.png}
+    gx:role: preview
   quality:
     type: File?
     outputBinding: {glob: output/quality.tif}

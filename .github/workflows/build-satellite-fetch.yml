@@ -81,7 +81,8 @@ jobs:
       - name: Smoke test
         # The recipe's offline half with synthetic inputs whose answers are
         # known: parameters, the output grid, the clear-sky rules, the
-        # Sentinel-2 offset, merging, and the COG written. A failure stops the
+        # Sentinel-2 offset, merging, the COG written, and whole runs with the
+        # catalog replaced, checking the optical preview. A failure stops the
         # job before the push. The network half runs in the fixture on Compute2.
         run: |
           IMAGE="$(cut -d, -f1 <<<"${{ steps.tags.outputs.tags }}")"
