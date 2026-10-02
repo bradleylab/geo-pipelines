@@ -36,11 +36,11 @@ ENV PATH=/opt/conda/bin:$PATH \
 
 COPY bin/satellite-fetch /usr/local/bin/satellite-fetch
 
-# Offline build check: the bindings and the STAC packages import, the COG
-# driver and GDAL's HTTP reader are present, and the entrypoint parses even
+# Offline build check: the bindings and the STAC packages import, the COG and
+# PNG drivers and GDAL's HTTP reader are present, and the entrypoint parses even
 # with an empty environment. No network.
 RUN chmod +x /usr/local/bin/satellite-fetch \
-    && python -c "from osgeo import gdal; import numpy, pystac_client, planetary_computer; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'; assert '/vsicurl/' in gdal.GetFileSystemsPrefixes(), 'GDAL built without its HTTP reader'" \
+    && python -c "from osgeo import gdal; import numpy, pystac_client, planetary_computer; assert gdal.GetDriverByName('COG') is not None, 'COG driver missing'; assert gdal.GetDriverByName('PNG') is not None, 'PNG driver missing'; assert '/vsicurl/' in gdal.GetFileSystemsPrefixes(), 'GDAL built without its HTTP reader'" \
     && gdalinfo --version \
     && env -i /usr/local/bin/satellite-fetch --help >/dev/null \
     && echo "satellite-fetch build check passed"
@@ -49,5 +49,5 @@ WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/satellite-fetch"]
 
 LABEL org.opencontainers.image.source="https://github.com/bradleylab/geo-pipelines"
-LABEL org.opencontainers.image.description="The clearest HLS, Sentinel-2 L2A or Sentinel-1 RTC scene of a site from Microsoft Planetary Computer, clipped to it (entrypoint contract v1)"
+LABEL org.opencontainers.image.description="The clearest HLS, Sentinel-2 L2A or Sentinel-1 RTC scene of a site from Microsoft Planetary Computer, clipped to it, with a false-color PNG preview of the optical scenes (entrypoint contract v1)"
 LABEL org.opencontainers.image.licenses="Apache-2.0"

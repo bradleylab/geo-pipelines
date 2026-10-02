@@ -66,7 +66,7 @@ it belongs in an analysis repo as a uv/conda env.
 | `geo-tools` | [`geo-tools/`](geo-tools/) | raster `.tif` or point cloud `.las`/`.laz` | COG / COPC / reprojected / hillshade | active (v1) |
 | `ground-surfaces` | [`ground-surfaces/`](ground-surfaces/) | point cloud `.las`/`.laz` | DTM + DSM + canopy height on one grid, CHM preview PNG, report | active (v1 in progress) |
 | `terrain-derivatives` | [`terrain-derivatives/`](terrain-derivatives/) | elevation model `.tif` | slope, aspect, hillshade, roughness, TRI, TPI on one grid; hillshade preview PNG; contours; report | active (v2 in progress) |
-| `satellite-fetch` | [`satellite-fetch/`](satellite-fetch/) | any raster `.tif` of a site | the clearest HLS, Sentinel-2 L2A or Sentinel-1 RTC scene over it from Planetary Computer, clipped; quality layer; report | active (v1 in progress) |
+| `satellite-fetch` | [`satellite-fetch/`](satellite-fetch/) | any raster `.tif` of a site | the clearest HLS, Sentinel-2 L2A or Sentinel-1 RTC scene over it from Planetary Computer, clipped; quality layer; false-color preview PNG (HLS, Sentinel-2); report | active (v2 in progress) |
 | `ortho-pipeline` | [`ortho-pipeline/`](ortho-pipeline/) | drone image dir (+ optional GCPs) | ortho `.tif` + DSM/DTM + point cloud | active (v1 in progress) |
 
 ## Using a pipeline
